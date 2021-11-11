@@ -1112,3 +1112,405 @@ public class SpringExtensionFactory implements ExtensionFactory, Lifecycle {
 
 
 
+# 配置解析
+
+​		`Dubbo`框架直接集成了`Spring`的能力，利用了`Spring`配置文件扩展出自定义的解析方式。`Dubbo`配置约束文件在`dubbo-config/dubbo-`
+
+`configspring/src/main/resources/dubbo.xsd`中。
+
+​		`dubbo.xsd`文件用来约束使用`XML`配置时的标签和对应的属性，`Spring`在解析到自定义的`namespace`标签时，会查找对应的`spring.schemas`和
+
+`spring.handlers`文件，最终触发`Dubbo`的`DubboNamespaceHandler`类来进行初始化和解析。
+
+
+
+## XML配置原理解析
+
+​		主要解析逻辑入口是在`DubboNamespaceHandler`类中完成的：
+
+```java
+public class DubboNamespaceHandler extends NamespaceHandlerSupport implements ConfigurableSourceBeanMetadataElement {
+
+   	...
+        
+    public void init() {
+        registerBeanDefinitionParser("application", new DubboBeanDefinitionParser(ApplicationConfig.class));
+        registerBeanDefinitionParser("module", new DubboBeanDefinitionParser(ModuleConfig.class));
+        registerBeanDefinitionParser("registry", new DubboBeanDefinitionParser(RegistryConfig.class));
+        registerBeanDefinitionParser("config-center", new DubboBeanDefinitionParser(ConfigCenterBean.class));
+        registerBeanDefinitionParser("metadata-report", new DubboBeanDefinitionParser(MetadataReportConfig.class));
+        registerBeanDefinitionParser("monitor", new DubboBeanDefinitionParser(MonitorConfig.class));
+        registerBeanDefinitionParser("metrics", new DubboBeanDefinitionParser(MetricsConfig.class));
+        registerBeanDefinitionParser("ssl", new DubboBeanDefinitionParser(SslConfig.class));
+        registerBeanDefinitionParser("provider", new DubboBeanDefinitionParser(ProviderConfig.class));
+        registerBeanDefinitionParser("consumer", new DubboBeanDefinitionParser(ConsumerConfig.class));
+        registerBeanDefinitionParser("protocol", new DubboBeanDefinitionParser(ProtocolConfig.class));
+        registerBeanDefinitionParser("service", new DubboBeanDefinitionParser(ServiceBean.class));
+        registerBeanDefinitionParser("reference", new DubboBeanDefinitionParser(ReferenceBean.class));
+        registerBeanDefinitionParser("annotation", new AnnotationBeanDefinitionParser());
+    }
+    ...
+}
+```
+
+​		`DubboNamespaceHandler`主要把不同的标签关联到解析实现类中。`registerBeanDefinitionParser`方法约定了在`Dubbo`框架中遇到标签`application、`
+
+`module`和`registry`等都会委托给`DubboBeanDefinitionParser`处理。
+
+​		解析`id`和`name`：
+
+```java
+	    // DubboBeanDefinitionParser 类中的 parse 方法片段
+		RootBeanDefinition beanDefinition = new RootBeanDefinition(); // 生成 Spring 的 Bean 定义
+        beanDefinition.setBeanClass(beanClass);
+        beanDefinition.setLazyInit(false);
+        // config id
+        String configId = resolveAttribute(element, "id", parserContext);
+        if (StringUtils.isNotEmpty(configId)) {
+            beanDefinition.getPropertyValues().addPropertyValue("id", configId);
+        }
+        // get id from name
+        if (StringUtils.isEmpty(configId)) {
+            configId = resolveAttribute(element, "name", parserContext);
+        }
+
+        String beanName = configId;
+        if (StringUtils.isEmpty(beanName)) {
+            // generate bean name
+            String prefix = beanClass.getName();
+            int counter = 0;
+            beanName = prefix + "#" + counter;
+            while (parserContext.getRegistry().containsBeanDefinition(beanName)) { // 确保 Spring 容器中没有重复的 id
+                beanName = prefix + "#" + (counter++);
+            }
+        }
+        beanDefinition.setAttribute(BEAN_NAME, beanName);
+```
+
+​		解析`<dubbo:service />、<dubbo:provider />、<dubbo:consumer />`标签：
+
+```java
+...
+else if (ServiceBean.class.equals(beanClass)) {
+	String className = resolveAttribute(element, "class", parserContext); // 如果配置了 class 属性
+	if (StringUtils.isNotEmpty(className)) {
+		RootBeanDefinition classDefinition = new RootBeanDefinition(); 
+		classDefinition.setBeanClass(ReflectUtils.forName(className));
+		classDefinition.setLazyInit(false);
+		parseProperties(element.getChildNodes(), classDefinition, parserContext);  // 解析标签中的 name，ref 等属性，把key-value键值对提取出来放到 BeanDefinition 中， 运行时 Spring 会自动处理注入值，因此 ServiceBean 就会包含用户配置的属性值
+		beanDefinition.getPropertyValues().addPropertyValue("ref", new BeanDefinitionHolder(classDefinition, beanName + "Impl")); // 将 class 配置的类的信息解析，并加入到 Spring 容器，然后注入
+}
+...
+    
+if (ProviderConfig.class.equals(beanClass)) {
+	parseNested(element, parserContext, ServiceBean.class, true, "service", "provider", beanName, beanDefinition);
+} else if (ConsumerConfig.class.equals(beanClass)) {
+	parseNested(element, parserContext, ReferenceBean.class, true, "reference", "consumer", beanName, beanDefinition);
+}
+```
+
+​		`parseNested`方法：主要逻辑是处理内部嵌套的标签，比如`<dubbo:provider />`内部可能嵌套了`<dubbo:service />`，如果使用了嵌套标签，则内部的标签对
+
+象会自动持有外层标签的对象，即解析内部的标签并生成`Bean`的时候，会把外层标签实例对象注入`Bean`中，这种设计方式允许内部标签直接获取外部标签属性。
+
+​		对于外部标签的属性：
+
+​				1、查找配置对象的`get、set`和`is`前缀方法，如果标签属性名和方法名称相同，则通过反射调用存储标签对应值。
+
+​				2、如果没有和`get、set`和`is`前缀方法匹配，则当作`parameters`参数存储，`parameters`是一个`Map`对象。
+
+```java
+        ....
+        ManagedMap parameters = null;
+        Set<String> processedProps = new HashSet<>();
+        for (Map.Entry<String, Class> entry : beanPropTypeMap.entrySet()) {
+            String beanProperty = entry.getKey();
+            Class type = entry.getValue();
+            String property = StringUtils.camelToSplitName(beanProperty, "-");
+            processedProps.add(property);
+            if ("parameters".equals(property)) { // 解析各种属性
+                parameters = parseParameters(element.getChildNodes(), beanDefinition, parserContext);
+            } else if ("methods".equals(property)) {
+                parseMethods(beanName, element.getChildNodes(), beanDefinition, parserContext);
+            } else if ("arguments".equals(property)) {
+                parseArguments(beanName, element.getChildNodes(), beanDefinition, parserContext);
+            } else {
+                String value = resolveAttribute(element, property, parserContext); // 获取标签属性值
+                if (value != null) {
+                    value = value.trim();
+                    if (value.length() > 0) {
+                        if ("registry".equals(property) && RegistryConfig.NO_AVAILABLE.equalsIgnoreCase(value)) {
+                            RegistryConfig registryConfig = new RegistryConfig();
+                            registryConfig.setAddress(RegistryConfig.NO_AVAILABLE);
+                            beanDefinition.getPropertyValues().addPropertyValue(beanProperty, registryConfig);
+                        } else if ("provider".equals(property) || "registry".equals(property) || ("protocol".equals(property) && AbstractServiceConfig.class.isAssignableFrom(beanClass))) {
+                            /**
+                             * For 'provider' 'protocol' 'registry', keep literal value (should be id/name) and set the value to 'registryIds' 'providerIds' protocolIds'
+                             * The following process should make sure each id refers to the corresponding instance, here's how to find the instance for different use cases:
+                             * 1. Spring, check existing bean by id, see{@link ServiceBean#afterPropertiesSet()}; then try to use id to find configs defined in remote Config Center
+                             * 2. API, directly use id to find configs defined in remote Config Center; if all config instances are defined locally, please use {@link ServiceConfig#setRegistries(List)}
+                             */
+                            beanDefinition.getPropertyValues().addPropertyValue(beanProperty + "Ids", value);
+                        } else {
+                            Object reference;
+                            if (isPrimitive(type)) {
+                                value = getCompatibleDefaultValue(property, value);
+                                reference = value;
+                            } else if (ONRETURN.equals(property) || ONTHROW.equals(property) || ONINVOKE.equals(property)) {
+                                int index = value.lastIndexOf(".");
+                                String ref = value.substring(0, index);
+                                String method = value.substring(index + 1);
+                                reference = new RuntimeBeanReference(ref);
+                                beanDefinition.getPropertyValues().addPropertyValue(property + METHOD, method);
+                            } else {
+                                if ("ref".equals(property) && parserContext.getRegistry().containsBeanDefinition(value)) {
+                                    BeanDefinition refBean = parserContext.getRegistry().getBeanDefinition(value);
+                                    if (!refBean.isSingleton()) {
+                                        throw new IllegalStateException("The exported service ref " + value + " must be singleton! Please set the " + value + " bean scope to singleton, eg: <bean id=\"" + value + "\" scope=\"singleton\" ...>");
+                                    }
+                                }
+                                reference = new RuntimeBeanReference(value);
+                            }
+                            if (reference != null) {
+                                beanDefinition.getPropertyValues().addPropertyValue(beanProperty, reference);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        NamedNodeMap attributes = element.getAttributes(); // 剩余不匹配的 attribute 当做 parameters 注入 bean 中
+        int len = attributes.getLength();
+        for (int i = 0; i < len; i++) {
+            Node node = attributes.item(i);
+            String name = node.getLocalName();
+            if (!processedProps.contains(name)) { // 排除已经解析的值
+                if (parameters == null) {
+                    parameters = new ManagedMap();
+                }
+                String value = node.getNodeValue();
+                parameters.put(name, new TypedStringValue(value, String.class));
+            }
+        }
+        if (parameters != null) {
+            beanDefinition.getPropertyValues().addPropertyValue("parameters", parameters);
+        }
+
+        ...
+        return beanDefinition;
+```
+
+​		本质上都是把属性注入`Spring`框架的`BeanDefinition`。如果属性是引用对象，则`Dubbo`默认会创建`RuntimeBeanReference`类型注入，运行时由`Spring`注入
+
+引用对象。`Dubbo`只做了属性提取的事情，运行时属性注入和转换都是`Spring`处理的。
+
+
+
+## 注解配置原理解析
+
+​		注解处理逻辑主要包含`3`部分内容，第一部分是如果用户使用了配置文件，则框架按需生成对应`Bean`，第二部分是要将所有使用`Dubbo`的注解`@Service`的
+
+`class`提升为`Bean`，第三部分要为使用`@Reference`注解的字段或方法注入代理对象。
+
+![](image/QQ截图20211111104805.png)
+
+```java
+...
+@EnableDubboConfig
+@DubboComponentScan
+public @interface EnableDubbo {
+	...
+}
+
+...
+@Import(DubboConfigConfigurationRegistrar.class)
+public @interface EnableDubboConfig {
+	...
+}
+
+...
+@Import(DubboComponentScanRegistrar.class)
+public @interface DubboComponentScan {
+	...
+}
+```
+
+
+
+​		使用注解`@DubboComponentScan`时，会激活`DubboComponentScanRegistrar`，同时生成`ServiceAnnotationPostProcessor`和
+
+`ReferenceAnnotationBeanPostProcessor`两种处理器，分别是处理服务注解和消费注解。`ServiceAnnotationPostProcessor`处理器实现了
+
+`BeanDefinitionRegistryPostProcessor`接口，`Spring`容器中所有`Bean`注册之后回调`postProcessBeanDefinitionRegistry`方法开始扫描`@Service`注解并注入容
+
+器：
+
+```java
+public class ServiceAnnotationPostProcessor implements BeanDefinitionRegistryPostProcessor, EnvironmentAware,
+    ...
+        
+    private Set<String> resolvedPackagesToScan;    
+    @Override
+    public void afterPropertiesSet() throws Exception {
+        this.resolvedPackagesToScan = resolvePackagesToScan(packagesToScan); // 获取用户注解的包扫描
+    }
+
+	...
+
+    @Override
+    public void postProcessBeanDefinitionRegistry(BeanDefinitionRegistry registry) throws BeansException {
+        this.registry = registry;
+        scanServiceBeans(resolvedPackagesToScan, registry);
+    }
+
+    
+    private void scanServiceBeans(Set<String> packagesToScan, BeanDefinitionRegistry registry) {
+
+        scaned = true;
+        if (CollectionUtils.isEmpty(packagesToScan)) {
+            if (logger.isWarnEnabled()) {
+                logger.warn("packagesToScan is empty , ServiceBean registry will be ignored!");
+            }
+            return;
+        }
+
+        DubboClassPathBeanDefinitionScanner scanner =
+                new DubboClassPathBeanDefinitionScanner(registry, environment, resourceLoader);
+
+        BeanNameGenerator beanNameGenerator = resolveBeanNameGenerator(registry);
+        scanner.setBeanNameGenerator(beanNameGenerator);
+        for (Class<? extends Annotation> annotationType : serviceAnnotationTypes) {
+            scanner.addIncludeFilter(new AnnotationTypeFilter(annotationType)); // 扫描 dubbo 下的 @Service ，而不会扫描 Spring 的 @Serivce
+        }
+
+        ScanExcludeFilter scanExcludeFilter = new ScanExcludeFilter();
+        scanner.addExcludeFilter(scanExcludeFilter);
+
+        for (String packageToScan : packagesToScan) {
+
+            // avoid duplicated scans
+            if (servicePackagesHolder.isPackageScanned(packageToScan)) {
+                if (logger.isInfoEnabled()) {
+                    logger.info("Ignore package who has already bean scanned: " + packageToScan);
+                }
+                continue;
+            }
+
+            // Registers @Service Bean first
+            scanner.scan(packageToScan); // 将 @Service 标注的类实例装入容器
+
+            // Finds all BeanDefinitionHolders of @Service whether @ComponentScan scans or not.
+            Set<BeanDefinitionHolder> beanDefinitionHolders =
+                    findServiceBeanDefinitionHolders(scanner, packageToScan, registry, beanNameGenerator); // 对扫描的服务创建BeanDefinitionHolder,用于生成 ServiceBean 定义
+
+            if (!CollectionUtils.isEmpty(beanDefinitionHolders)) {
+                if (logger.isInfoEnabled()) {
+                    List<String> serviceClasses = new ArrayList<>(beanDefinitionHolders.size());
+                    for (BeanDefinitionHolder beanDefinitionHolder : beanDefinitionHolders) {
+                        serviceClasses.add(beanDefinitionHolder.getBeanDefinition().getBeanClassName());
+                    }
+                    logger.info("Found " + beanDefinitionHolders.size() + " classes annotated by Dubbo @Service under package [" + packageToScan + "]: " + serviceClasses);
+                }
+
+                for (BeanDefinitionHolder beanDefinitionHolder : beanDefinitionHolders) {
+                    processScannedBeanDefinition(beanDefinitionHolder, registry, scanner); // 注册 ServiceBean 并做数据绑定和解析
+                    servicePackagesHolder.addScannedClass(beanDefinitionHolder.getBeanDefinition().getBeanClassName());
+                }
+            } else {
+                if (logger.isWarnEnabled()) {
+                    logger.warn("No class annotated by Dubbo @Service was found under package ["
+                            + packageToScan + "], ignore re-scanned classes: " + scanExcludeFilter.getExcludedCount());
+                }
+            }
+
+            servicePackagesHolder.addScannedPackage(packageToScan);
+        }
+    }
+
+    ...
+}
+```
+
+​		1、`Dubbo`框架首先会提取用户配置的扫描包名称，因为包名可能使用`${...}`占位符，因此框架会调用`Spring`的占位符解析做进一步解码。
+
+​		2、开始真正的注解扫描，委托`Spring`对所有符合包名的`.class`文件做字节码分析，最终通过。
+
+​		3、配置扫描`@Service`注解作为过滤条件。
+
+​		4、将`@Service`标注的服务提升为不同的`Bean`，这里并没有设置`beanClass`。
+
+​		5、主要根据注册的普通`Bean`生成`ServiceBean`的占位符，用于后面的属性注入逻辑。
+
+​		6、提取普通`Bean`上标注的`@Service`注解生成新的`RootBeanDefinition`，用于`Spring`启动后的服务暴露。
+
+
+
+​		在实际使用过程中，会在`@Service`注解的服务中注入`@Reference`注解，这样就可以很方便地发起远程服务调用，`Dubbo`中做属性注入是通过
+
+`ReferenceAnnotationBeanPostProcessor`处理的：
+
+​				1、获取类中标注的`@Reference`注解的字段和方法。
+
+​				2、反射设置字段或方法对应的引用。
+
+```java
+public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBeanPostProcessor
+        implements ApplicationContextAware, BeanFactoryPostProcessor {
+	
+    ...
+    
+    @Override
+    public PropertyValues postProcessPropertyValues(
+            PropertyValues pvs, PropertyDescriptor[] pds, Object bean, String beanName) throws BeansException {
+
+        try {
+            AnnotatedInjectionMetadata metadata = findInjectionMetadata(beanName, bean.getClass(), pvs); // 查找 Bean 所有标注了@Reference的字段和方法
+            prepareInjection(metadata);
+            metadata.inject(bean, beanName, pvs); // 对字段、方法进行反射绑定
+        } catch (BeansException ex) {
+            throw ex;
+        } catch (Throwable ex) {
+            throw new BeanCreationException(beanName, "Injection of @" + getAnnotationType().getSimpleName()
+                    + " dependencies is failed", ex);
+        }
+        return pvs;
+    }
+    private List<AbstractAnnotationBeanPostProcessor.AnnotatedFieldElement> findFieldAnnotationMetadata(final Class<?> beanClass) {
+
+        final List<AbstractAnnotationBeanPostProcessor.AnnotatedFieldElement> elements = new LinkedList<AbstractAnnotationBeanPostProcessor.AnnotatedFieldElement>();
+
+        ReflectionUtils.doWithFields(beanClass, new ReflectionUtils.FieldCallback() {
+            @Override
+            public void doWith(Field field) throws IllegalArgumentException, IllegalAccessException {
+
+                for (Class<? extends Annotation> annotationType : getAnnotationTypes()) { // 遍历服务类所有的字段，查找@Reference注解标注
+
+                    AnnotationAttributes attributes = getAnnotationAttributes(field, annotationType, getEnvironment(), true, true);
+
+                    if (attributes != null) {
+
+                        if (Modifier.isStatic(field.getModifiers())) {
+                            if (logger.isWarnEnabled()) {
+                                logger.warn("@" + annotationType.getName() + " is not supported on static fields: " + field);
+                            }
+                            return;
+                        }
+
+                        elements.add(new AnnotatedFieldElement(field, attributes));
+                    }
+                }
+            }
+        });
+
+        return elements;
+
+    }
+    ...
+}
+```
+
+
+
+
+
