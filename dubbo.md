@@ -16,110 +16,6 @@
 
 ![](image/QQ截图20211108101350.png)
 
-# Hello World
-
-​		服务端：
-
-```java
-public interface HelloService {
-    String sayHello();
-}
-
-// 配置服务,可以配置 methods 属性控制多个方法的超时时间，重试次数等信息
-@DubboService
-public class AnnotationHelloServiceImpl implements HelloService {
-    @Override
-    public String sayHello() {
-        System.out.println("Hello World");
-        return "Annotation, hello " + name;
-    }
-}
-```
-
-```java
-@Configuration
-@EnableDubbo(scanBasePackages = "org.apache.dubbo.samples.annotation.impl") // 配置扫描服务的包
-@PropertySource("classpath:/spring/dubbo-provider.properties")
-public class ProviderConfiguration {
-    @Bean
-    public ProviderConfig providerConfig() {
-        ProviderConfig providerConfig = new ProviderConfig();
-        providerConfig.setTimeout(1000); // 设置全局服务的超时时间
-        return providerConfig;
-    }
-}
-```
-
-```properties
-# dubbo-provider.properties
-dubbo.application.name=samples-annotation-provider
-dubbo.registry.address=zookeeper://${zookeeper.address:127.0.0.1}:2181
-dubbo.protocol.name=dubbo
-dubbo.protocol.port=20880
-dubbo.provider.token=true
-```
-
-```java
-public static void main(String[] args) throws Exception {
-        AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext(ProviderConfiguration.class); // Spring加载IOC
-        context.start();
-
-        System.out.println("dubbo service started.");
-        new CountDownLatch(1).await();
-    }
-```
-
-
-
-​		消费端：
-
-```java
-@Component("annotationAction")
-public class AnnotationAction {
-
-    // 配置调用的远程服务，同样可以配置 methods 属性，这里配置的信息会覆盖服务器配置的信息
-    @DubboReference(interfaceClass = HelloService.class, version = AnnotationConstants.VERSION)
-    private HelloService helloService;
-
-    public String doSayHello() {
-        try {
-            return helloService.sayHello();
-        } catch (Exception e) {
-            e.printStackTrace();
-            return "Throw Exception";
-        }
-    }
-}
-```
-
-```java
-@Configuration
-@EnableDubbo(scanBasePackages = "org.apache.dubbo.samples.annotation.action") // 配置扫描服务的包
-@PropertySource("classpath:/spring/dubbo-consumer.properties")
-@ComponentScan(value = {"org.apache.dubbo.samples.annotation.action"}) // Spring 扫描 Bean 的路径
-public class ConsumerConfiguration {
-
-}
-```
-
-```properties
-# dubbo-consumer.properties
-dubbo.application.name=samples-annotation-consumer
-dubbo.registry.address=zookeeper://${zookeeper.address:127.0.0.1}:2181
-dubbo.application.qosEnable=true
-dubbo.application.qosPort=33333
-dubbo.application.qosAcceptForeignIp=false
-```
-
-```java
-public static void main(String[] args) {
-        AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext(ConsumerConfiguration.class);
-        context.start();
-        final AnnotationAction annotationAction = (AnnotationAction) context.getBean("annotationAction");
-		System.out.println("hello : " + annotationAction.doSayHello());
-}
-```
-
 
 
 # 注册中心
@@ -1501,7 +1397,303 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
 
 
 
+# Hello World(注解开发)
 
+​		服务端：
+
+```java
+public interface HelloService {
+    String sayHello();
+}
+
+// 配置服务,可以配置 methods 属性控制多个方法的超时时间，重试次数等信息
+@DubboService
+public class AnnotationHelloServiceImpl implements HelloService {
+    @Override
+    public String sayHello() {
+        System.out.println("Hello World");
+        return "Annotation, hello " + name;
+    }
+}
+```
+
+```java
+@Configuration
+@EnableDubbo(scanBasePackages = "org.apache.dubbo.samples.annotation.impl") // 配置扫描服务的包
+@PropertySource("classpath:/spring/dubbo-provider.properties")
+public class ProviderConfiguration {
+    @Bean
+    public ProviderConfig providerConfig() {
+        ProviderConfig providerConfig = new ProviderConfig();
+        providerConfig.setTimeout(1000); // 设置全局服务的超时时间
+        return providerConfig;
+    }
+}
+```
+
+```properties
+# dubbo-provider.properties
+dubbo.application.name=samples-annotation-provider
+dubbo.registry.address=zookeeper://${zookeeper.address:127.0.0.1}:2181
+dubbo.protocol.name=dubbo
+dubbo.protocol.port=20880
+dubbo.provider.token=true
+```
+
+```java
+public static void main(String[] args) throws Exception {
+        AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext(ProviderConfiguration.class); // Spring加载IOC
+        context.start();
+
+        System.out.println("dubbo service started.");
+        new CountDownLatch(1).await();
+    }
+```
+
+
+
+​		消费端：
+
+```java
+@Component("annotationAction")
+public class AnnotationAction {
+
+    // 配置调用的远程服务，同样可以配置 methods 属性，这里配置的信息会覆盖服务器配置的信息
+    @DubboReference(interfaceClass = HelloService.class, version = AnnotationConstants.VERSION)
+    private HelloService helloService;
+
+    public String doSayHello() {
+        try {
+            return helloService.sayHello();
+        } catch (Exception e) {
+            e.printStackTrace();
+            return "Throw Exception";
+        }
+    }
+}
+```
+
+```java
+@Configuration
+@EnableDubbo(scanBasePackages = "org.apache.dubbo.samples.annotation.action") // 配置扫描服务的包
+@PropertySource("classpath:/spring/dubbo-consumer.properties")
+@ComponentScan(value = {"org.apache.dubbo.samples.annotation.action"}) // Spring 扫描 Bean 的路径
+public class ConsumerConfiguration {
+
+}
+```
+
+```properties
+# dubbo-consumer.properties
+dubbo.application.name=samples-annotation-consumer
+dubbo.registry.address=zookeeper://${zookeeper.address:127.0.0.1}:2181
+dubbo.application.qosEnable=true
+dubbo.application.qosPort=33333
+dubbo.application.qosAcceptForeignIp=false
+```
+
+```java
+public static void main(String[] args) {
+        AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext(ConsumerConfiguration.class);
+        context.start();
+        final AnnotationAction annotationAction = (AnnotationAction) context.getBean("annotationAction");
+		System.out.println("hello : " + annotationAction.doSayHello());
+}
+```
+
+
+
+# API开发
+
+​		服务端：
+
+```java
+public interface GreetingsService {
+    String sayHi(String name);
+}
+public class GreetingsServiceImpl implements GreetingsService {
+    @Override
+    public String sayHi(String name) {
+        return "hi, " + name;
+    }
+}
+```
+
+```java
+public class Application {
+    private static String zookeeperHost = System
+            .getProperty("zookeeper.address", "127.0.0.1");
+    private static String zookeeperPort = System.getProperty("zookeeper.port",
+            "2181");
+
+    public static void main(String[] args) throws Exception {
+        ServiceConfig<GreetingsService> service = new ServiceConfig<>();
+        service.setApplication(new ApplicationConfig("first-dubbo-provider"));
+        service.setRegistry(new RegistryConfig(
+                "zookeeper://" + zookeeperHost + ":" + zookeeperPort)); // 设置注册中心
+        service.setInterface(GreetingsService.class);
+        service.setRef(new GreetingsServiceImpl()); // 服务实例
+        service.export();
+
+        System.out.println("dubbo service started");
+        new CountDownLatch(1).await();
+    }
+}
+```
+
+​		消费端：
+
+```java
+public class Application {
+    private static String zookeeperHost = System
+            .getProperty("zookeeper.address", "127.0.0.1");
+    private static String zookeeperPort = System.getProperty("zookeeper.port",
+            "2181");
+
+    public static void main(String[] args) {
+        ReferenceConfig<GreetingsService> reference = new ReferenceConfig<>();
+        reference.setApplication(new ApplicationConfig("first-dubbo-consumer"));
+        reference.setRegistry(new RegistryConfig(
+                "zookeeper://" + zookeeperHost + ":" + zookeeperPort));
+        reference.setInterface(GreetingsService.class);
+        GreetingsService service = reference.get(); // 获取服务实例
+        String message = service.sayHi("dubbo"); // 调用远程服务
+        System.out.println(message);
+    }
+}
+```
+
+
+
+# 获取消费端参数
+
+​		服务端：
+
+```java
+public interface ShowParamter {
+    void show();
+}
+
+@DubboService
+public class ShowParamterImpl implements ShowParamter
+{
+    @Override
+    public void show() {
+        RpcContext context = RpcContext.getContext();
+
+        System.out.println(context.getLocalAddress());
+
+        Map<String, String> attachments = context.getAttachments();
+        for(Map.Entry<String,String> temp : attachments.entrySet())
+        {
+            System.out.println("key:" + temp.getKey() + " value:" + temp.getValue());
+        }
+    }
+}
+```
+
+```java
+@Configuration
+@EnableDubbo(scanBasePackages = "com.shanji.over.impl")
+public class ServerConfig {
+
+    @Bean
+    public ApplicationConfig applicationConfig(){
+        ApplicationConfig applicationConfig = new ApplicationConfig();
+        applicationConfig.setName("dubbo-server-annotation");
+        return applicationConfig;
+    }
+
+    @Bean
+    public ProviderConfig providerConfig() {
+        ProviderConfig providerConfig = new ProviderConfig();
+        providerConfig.setTimeout(1000); // 设置全局服务的超时时间
+        return providerConfig;
+    }
+
+    @Bean
+    public RegistryConfig registryConfig()
+    {
+        RegistryConfig registryConfig = new RegistryConfig();
+        registryConfig.setAddress("zookeeper://127.0.0.1:2181");
+        return registryConfig;
+    }
+
+}
+```
+
+```java
+public class Server
+{
+    public static void main(String[] args) throws Exception {
+        AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext(ServerConfig.class);
+        context.start();
+
+        System.out.println("dubbo service started.");
+        new CountDownLatch(1).await();
+    }
+}
+```
+
+​		消费端：
+
+```java
+@Component
+public class ShowAction
+{
+    @DubboReference(interfaceClass = ShowParamter.class)
+    private ShowParamter showParamter;
+
+    public void show()
+    {
+        showParamter.show();
+    }
+}
+```
+
+```java
+@Configuration
+@ComponentScan("com.shanji.over.action")
+@EnableDubbo(scanBasePackages = "com.shanji.over.action") // 这个注解别忘
+public class ClientConfig {
+
+    @Bean
+    public ApplicationConfig applicationConfig(){
+        ApplicationConfig applicationConfig = new ApplicationConfig();
+        applicationConfig.setName("dubbo-client-annotation");
+        applicationConfig.setQosEnable(true);
+        applicationConfig.setQosPort(33333);
+        applicationConfig.setQosAcceptForeignIpCompatible(false);
+        return applicationConfig;
+    }
+
+    @Bean
+    public RegistryConfig registryConfig()
+    {
+        RegistryConfig registryConfig = new RegistryConfig();
+        registryConfig.setAddress("zookeeper://127.0.0.1:2181");
+        registryConfig.setPort(2181);
+        return registryConfig;
+    }
+
+}
+```
+
+```java
+public class Client
+{
+    public static void main(String[] args) {
+        AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext(ClientConfig.class);
+        context.start();
+
+
+//        RpcContext.getContext().setAttachment("index","1");
+        ShowAction showAction = context.getBean("showAction", ShowAction.class);
+        showAction.show();
+
+    }
+}
+```
 
 
 
