@@ -1579,6 +1579,13 @@ public class ShowParamterImpl implements ShowParamter
 {
     @Override
     public void show() {
+        
+        /**
+        服务端：
+        RpcContext.getContext()，RpcContext.getServiceContext()，RpcContext.getServerAttachment() 可以通过这几种方式获取到消费端传递的参数
+        RpcContext.getServerContext()，RpcContext.getClientAttachment() 不能获取到消费端传递的参数
+        */
+        
         RpcContext context = RpcContext.getContext();
 
         System.out.println(context.getLocalAddress());
@@ -1687,7 +1694,16 @@ public class Client
         context.start();
 
 
-//        RpcContext.getContext().setAttachment("index","1");
+        /**
+        客户端：
+        RpcContext.getContext(),RpcContext.getServiceContext(),RpcContext.getClientAttachment() 使用这三种方式获取的 context 都可以传递参数，并且参数只在当次调用有效，下一次调用将清空
+        RpcContext.getServerContext() 这种方式获取的 context 不能传递参数
+        RpcContext.getServerAttachment() 这种方式获取的 context 传递的参数将在多次调用中都有效
+        */
+	   RpcContext.getContext().setAttachment("index","1"); 
+        
+        
+        
         ShowAction showAction = context.getBean("showAction", ShowAction.class);
         showAction.show();
 
@@ -1696,6 +1712,55 @@ public class Client
 ```
 
 
+
+# 自动注入（结合Spring）
+
+```java
+@Configuration
+@ComponentScan("com.shanji.over.action")
+@EnableDubbo(scanBasePackages = "com.shanji.over.action")
+public class ClientConfig {
+
+    @DubboReference(interfaceClass = ShowParamter.class)
+    private ShowParamter showParamter; // 通过在这里获取远程服务接口，并注入 Spring
+
+    @Bean
+    public ApplicationConfig applicationConfig(){
+        ApplicationConfig applicationConfig = new ApplicationConfig();
+        applicationConfig.setName("dubbo-client-annotation");
+        applicationConfig.setQosEnable(true);
+        applicationConfig.setQosPort(33333);
+        applicationConfig.setQosAcceptForeignIpCompatible(false);
+        return applicationConfig;
+    }
+
+    @Bean
+    public RegistryConfig registryConfig()
+    {
+        RegistryConfig registryConfig = new RegistryConfig();
+        registryConfig.setAddress("zookeeper://127.0.0.1:2181");
+        registryConfig.setPort(2181);
+        return registryConfig;
+    }
+
+}
+```
+
+```java
+@Component
+public class ShowAction
+{
+    @Autowired
+    private ShowParamter showParamter; // 在这里使用 Spring 的依赖注入
+
+    public void show()
+    {
+        showParamter.show();
+    }
+}
+```
+
+​		在消费端配置时，获取到远程服务接口并注入`Spring`的`IOC`容器中，此后在消费端的任何地方都可以通过`Spring`的依赖注入，来引用这个远程服务接口。
 
 
 
