@@ -1764,3 +1764,159 @@ public class ShowAction
 
 
 
+# 集成Mybatis
+
+​		服务端：
+
+```java
+@SpringBootApplication
+@MapperScan("com.shanji.over.mapper")
+@ComponentScan("com.shanji.over.config")
+public class SpiExamplesApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(SpiExamplesApplication.class, args);
+    }
+
+}
+```
+
+```java
+@Configuration
+public class DBConfig{
+    @Bean
+    public DataSource dataSource()
+    {
+        DruidDataSource dataSource = new DruidDataSource();
+        dataSource.setUrl("jdbc:mysql://127.0.0.1:3306/xiaoshanshan?useSSL=false&useUnicode=true&characterEncoding=utf-8&zeroDateTimeBehavior=convertToNull&autoReconnect=true");
+        dataSource.setDriverClassName("com.mysql.cj.jdbc.Driver");
+        dataSource.setUsername("root");
+        dataSource.setPassword("");
+        return dataSource;
+    }
+}
+```
+
+```java
+@Configuration
+@EnableDubbo(scanBasePackages = "com.shanji.over.impl")
+public class ProviderCofig{
+    @Bean
+    public ApplicationConfig applicationConfig(){
+        ApplicationConfig applicationConfig = new ApplicationConfig();
+        applicationConfig.setName("mybatis-provider");
+        return applicationConfig;
+    }
+
+    @Bean
+    public ProtocolConfig protocolConfig(){
+        ProtocolConfig protocolConfig = new ProtocolConfig();
+        protocolConfig.setName("dubbo");
+        protocolConfig.setPort(20880);
+        return protocolConfig;
+    }
+
+    @Bean
+    public RegistryConfig registryConfig(){
+        RegistryConfig registryConfig = new RegistryConfig();
+        registryConfig.setAddress("zookeeper://127.0.0.1:2181");
+        return registryConfig;
+    }
+
+    @Bean
+    public ProviderConfig providerConfig(){
+        ProviderConfig providerConfig = new ProviderConfig();
+        providerConfig.setToken(true);
+        return providerConfig;
+    }
+}
+```
+
+```java
+public interface UserInfoService {
+    public User selectByid(long id);
+}
+@Service
+@DubboService
+public class UserInfoServiceImpl implements UserInfoService {
+
+    @Autowired
+    private UserInfoMapper userInfoMapper;
+
+    @Override
+    public User selectByid(long id) {
+        return userInfoMapper.selectById(id);
+    }
+}
+```
+
+```xml
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd" >
+<mapper namespace="com.shanji.over.mapper.UserInfoMapper">
+
+    <resultMap id="BASE_RESULT" type="com.shanji.over.entity.User">
+        <id column="id" property="id"/>
+        <result column="name" property="name"/>
+    </resultMap>
+
+    <select id="findByUserId" resultMap="BASE_RESULT">
+        SELECT id, name
+        FROM user
+        where id = #{userId}
+    </select>
+</mapper>
+```
+
+
+
+​		消费端：
+
+```java
+@Component
+public class UserAction {
+
+    @Autowired
+    private UserInfoService userInfoService;
+
+    public User getUser(){
+        return userInfoService.selectByid(1);
+    }
+}
+```
+
+```java
+@EnableDubbo
+@Configuration
+@ComponentScan("com.shanji.over.action")
+public class CousmerConfig {
+
+    @DubboReference
+    private UserInfoService userInfoService;
+
+    @Bean
+    public ApplicationConfig applicationConfig(){
+        ApplicationConfig applicationConfig = new ApplicationConfig();
+        applicationConfig.setName("mybatis-consumer");
+        return applicationConfig;
+    }
+
+    @Bean
+    public RegistryConfig registryConfig(){
+        RegistryConfig registryConfig = new RegistryConfig();
+        registryConfig.setAddress("zookeeper://121.5.30.71:2181");
+        return registryConfig;
+    }
+}
+```
+
+```java
+public class MainController {
+    public static void main(String[] args) {
+        AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext(CousmerConfig.class);
+        context.start();
+
+        UserAction action = context.getBean("userAction", UserAction.class);
+        System.out.println(action.getUser());
+    }
+}
+```
+
