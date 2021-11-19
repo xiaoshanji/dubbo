@@ -1397,6 +1397,444 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
 
 
 
+# 服务暴露
+
+​		配置优先级：
+
+​				1、通过`-D`传递给`JVM`参数优先级最高。
+
+​				2、代码或`XML`配置优先级次高。
+
+​				3、配置文件优先级最低。一般将配置文件的值作为默认值，共享公共配置。
+
+​		配置也会受到服务方的影响：
+
+​				1、如果只有服务方指定配置，则会自动透传到消费方。
+
+​				2、如果消费方也配置了相应属性，则服务方配置会被覆盖。
+
+## 远程服务暴露
+
+![](image/QQ截图20211119110911.png)
+
+​		`Dubbo`框架做服务暴露分为两大部分，第一步将持有的服务实例通过代理转换成`Invoker`，第二步会把`Invoker`通过具体的协议转换成`Exporter`。框架做了
+
+这层抽象也大大方便了功能扩展。这里的`Invoker`可以简单理解成一个真实的服务对象实例，是`Dubbo`框架实体域，所有模型都会向它靠拢，可向它发起`invoke`
+
+调用。它可能是一个本地的实现，也可能是一个远程的实现，还可能是一个集群实现。
+
+​		多注册中心同时写：配置了服务同时注册多个注册中心，则会依次暴露
+
+```java
+	private void doExportUrls() {
+        ModuleServiceRepository repository = getScopeModel().getServiceRepository();
+        ServiceDescriptor serviceDescriptor = repository.registerService(getInterfaceClass());
+        providerModel = new ProviderModel(getUniqueServiceName(),
+            ref,
+            serviceDescriptor,
+            this,
+            getScopeModel(),
+            serviceMetadata);
+
+        repository.registerProvider(providerModel);
+
+        List<URL> registryURLs = ConfigValidationUtils.loadRegistries(this, true); // 获取当前服务的配置中心
+
+        for (ProtocolConfig protocolConfig : protocols) {
+            String pathKey = URL.buildKey(getContextPath(protocolConfig)
+                    .map(p -> p + "/" + path)
+                    .orElse(path), group, version);
+            // In case user specified path, register service one more time to map it to path.
+            repository.registerService(pathKey, interfaceClass);
+            doExportUrlsFor1Protocol(protocolConfig, registryURLs); // 根据协议暴露服务，如果存在多个协议，则会依次暴露，协议暴露后将注册元数据写入到对应的注册中心
+        }
+    }
+```
+
+```java
+	private void doExportUrlsFor1Protocol(ProtocolConfig protocolConfig, List<URL> registryURLs) {
+        Map<String, String> map = buildAttributes(protocolConfig);
+
+        //init serviceMetadata attachments
+        serviceMetadata.getAttachments().putAll(map);
+
+        URL url = buildUrl(protocolConfig, registryURLs, map);
+
+        exportUrl(url, registryURLs);
+    }
+
+
+	private Map<String, String> buildAttributes(ProtocolConfig protocolConfig) {
+
+        Map<String, String> map = new HashMap<String, String>();
+        map.put(SIDE_KEY, PROVIDER_SIDE);
+
+        // append params with basic configs,
+        ServiceConfig.appendRuntimeParameters(map);
+        AbstractConfig.appendParameters(map, getApplication()); // 读取其他配置，用于后续构造URL
+        AbstractConfig.appendParameters(map, getModule());
+        // remove 'default.' prefix for configs from ProviderConfig
+        // appendParameters(map, provider, Constants.DEFAULT_KEY);
+        AbstractConfig.appendParameters(map, provider);
+        AbstractConfig.appendParameters(map, protocolConfig);
+        AbstractConfig.appendParameters(map, this);
+        appendMetricsCompatible(map);
+
+        ...
+
+        return map;
+    }
+
+
+	private void exportUrl(URL url, List<URL> registryURLs) {
+        String scope = url.getParameter(SCOPE_KEY);
+        // don't export when none is configured
+        if (!SCOPE_NONE.equalsIgnoreCase(scope)) {
+
+            // export to local if the config is not remote (export to remote only when config is remote)
+            if (!SCOPE_REMOTE.equalsIgnoreCase(scope)) { // 暴露本地服务
+                exportLocal(url);
+            }
+
+            // export to remote if the config is not local (export to local only when config is local)
+            if (!SCOPE_LOCAL.equalsIgnoreCase(scope)) {
+                url = exportRemote(url, registryURLs); // 暴露远程服务
+                MetadataUtils.publishServiceDefinition(url);
+            }
+
+        }
+        this.urls.add(url);
+    }
+
+	private URL exportRemote(URL url, List<URL> registryURLs) {
+        if (CollectionUtils.isNotEmpty(registryURLs)) { // 有注册中心的情况
+            for (URL registryURL : registryURLs) {
+                if (SERVICE_REGISTRY_PROTOCOL.equals(registryURL.getProtocol())) {
+                    url = url.addParameterIfAbsent(SERVICE_NAME_MAPPING_KEY, "true");
+                }
+
+                //if protocol is only injvm ,not register
+                if (LOCAL_PROTOCOL.equalsIgnoreCase(url.getProtocol())) {
+                    continue;
+                }
+
+                url = url.addParameterIfAbsent(DYNAMIC_KEY, registryURL.getParameter(DYNAMIC_KEY));
+                URL monitorUrl = ConfigValidationUtils.loadMonitor(this, registryURL);
+                if (monitorUrl != null) {
+                    url = url.putAttribute(MONITOR_KEY, monitorUrl); // 如果配置了监控地址，则服务调用信息会上报
+                }
+
+                // For providers, this is used to enable custom proxy to generate invoker
+                String proxy = url.getParameter(PROXY_KEY);
+                if (StringUtils.isNotEmpty(proxy)) {
+                    registryURL = registryURL.addParameter(PROXY_KEY, proxy);
+                }
+
+                if (logger.isInfoEnabled()) {
+                    if (url.getParameter(REGISTER_KEY, true)) {
+                        logger.info("Register dubbo service " + interfaceClass.getName() + " url " + url.getServiceKey() + " to registry " + registryURL.getAddress());
+                    } else {
+                        logger.info("Export dubbo service " + interfaceClass.getName() + " to url " + url.getServiceKey());
+                    }
+                }
+
+                doExportUrl(registryURL.putAttribute(EXPORT_KEY, url), true);
+            }
+
+        } else { // 无注册中心
+
+            if (MetadataService.class.getName().equals(url.getServiceInterface())) {
+                localMetadataService.setMetadataServiceURL(url);
+            }
+
+            if (logger.isInfoEnabled()) {
+                logger.info("Export dubbo service " + interfaceClass.getName() + " to url " + url);
+            }
+
+            doExportUrl(url, true);
+        }
+        return url;
+    }
+```
+
+```java
+	private void doExportUrl(URL url, boolean withMetaData) {
+        Invoker<?> invoker = proxyFactory.getInvoker(ref, (Class) interfaceClass, url); // 通过动态代理转换成Invoker, registryURL存储的是注册中心地址，使用export作为key追加服务元数据信息
+        if (withMetaData) {
+            invoker = new DelegateProviderMetaDataInvoker(invoker, this);
+        }
+        Exporter<?> exporter = protocolSPI.export(invoker); // 暴露后，向注册中心注册服务信息
+        exporters.add(exporter);
+    }
+```
+
+​		整个逻辑：
+
+​				1、通过反射获取配置对象并放到`map`中用于后续构造`URL`参数(比如 应用名等)。
+
+​				2、区分全局配置，默认在属性前面增加`default.`前缀，当框架获取`URL`中的参数时，如果不存在则会自动尝试获取`default.`前缀对应的值。
+
+​				3、处理本地内存`JVM`协议暴露。
+
+​				4、追加监控上报地址，框架会在拦截器中执行数据上报，这部分是可选的。
+
+​				5、通过动态代理的方式创建`Invoker`对象，在服务端生成的是`AbstractProxylnvoker`实例，所有真实的方法调用都会委托给代理，然后代理转发给服务 
+
+​		`ref`调用。目前框架实现两种代理：`JavassistProxyFactory`和`JdkProxyFactory`。`JavassistProxyFactory`模式原理：创建`Wrapper`子类，在子类中实现
+
+​		`invokeMethod`方法，方法体内会为每个`ref`方法都做方法名和方法参数匹配校验，如果匹配则直接调用即可，相比`JdkProxyFactory`省去了反射调用的开
+
+​		销。`JdkProxyFactory`模式是我们常见的用法，通过反射获取真实对象的方法，然后调用即可。
+
+​				6、先触发服务暴露`(`端口打开等`)`，然后进行服务元数据注册。
+
+​				7、处理没有使用注册中心的场景，直接进行服务暴露，不需要元数据注册，因为这里暴露的`URL`信息是以具体`RPC`协议开头的，并不是以注册中心协议
+
+​		开头的。
+
+​		在将服务实例`ref`转换成`Invoker`之后，如果有注册中心时，则会通过`RegistryProtocol#export`进行更细粒度的控制：
+
+​				1、委托具体协议`(Dubbo)`进行服务暴露，创建`NettyServer`监听端口和保存服务实例。
+
+​				2、创建注册中心对象，与注册中心创建`TCP`连接。
+
+​				3、注册服务元数据到注册中心。
+
+​				4、订阅`configurators`节点，监听服务动态属性变更事件。
+
+​				5、服务销毁收尾工作，比如关闭端口、反注册服务信息等。
+
+```java
+	public <T> Exporter<T> export(final Invoker<T> originInvoker) throws RpcException {
+        ...
+            
+        //export invoker
+        final ExporterChangeableWrapper<T> exporter = doLocalExport(originInvoker, providerUrl); // 打开端口，把服务实例存储到 map
+
+        // url to registry
+        final Registry registry = getRegistry(registryUrl); // 创建注册中心实例
+        final URL registeredProviderUrl = getUrlToRegistry(providerUrl, registryUrl);
+
+        // decide if we need to delay publish
+        boolean register = providerUrl.getParameter(REGISTER_KEY, true);
+        if (register) {
+            register(registry, registeredProviderUrl); // 服务暴露之后，注册服务元数据
+        }
+
+        // register stated url on provider model
+        registerStatedUrl(registryUrl, registeredProviderUrl, register);
+
+
+        exporter.setRegisterUrl(registeredProviderUrl);
+        exporter.setSubscribeUrl(overrideSubscribeUrl);
+
+        // Deprecated! Subscribe to override rules in 2.6.x or before.
+        registry.subscribe(overrideSubscribeUrl, overrideSubscribeListener); // 监听服务接口下 configurators 节点，用于处理动态配置
+
+        notifyExport(exporter);
+        //Ensure that a new exporter instance is returned every time export
+        return new DestroyableExporter<>(exporter); // exporter 是 ExporterChangeableWrapper 的实例
+    }
+```
+
+```java
+	private static class DestroyableExporter<T> implements Exporter<T> {
+
+        private Exporter<T> exporter;
+
+        public DestroyableExporter(Exporter<T> exporter) {
+            this.exporter = exporter;
+        }
+
+        @Override
+        public Invoker<T> getInvoker() {
+            return exporter.getInvoker();
+        }
+
+        @Override
+        public void unexport() { // Invoker 销毁时注销端口和 map 中服务实例等资源
+            exporter.unexport();
+        }
+    }
+```
+
+
+
+​		在进行服务暴露前，框架会做拦截器初始化，`Dubbo`在加载`protocol`扩展点时会自动注入`ProtocolListenerwrapper`和`ProtocolFilterWrapper`：
+
+![](image/QQ截图20211119133759.png)
+
+​		在`ProtocolListenerWrapper`实现中，在对服务提供者进行暴露时回调对应的监听器方法。 `ProtocolFilterWrapper`会调用下一级
+
+`ListenerExporterWrapper#export`方法，在该方法内部会触发`buildlnvokerChain`进行拦截器构造：
+
+```java
+	// ProtocolFilterWrapper
+    public <T> Exporter<T> export(Invoker<T> invoker) throws RpcException {
+        if (UrlUtils.isRegistry(invoker.getUrl())) {
+            return protocol.export(invoker);
+        }
+        FilterChainBuilder builder = getFilterChainBuilder(invoker.getUrl()); // 构造拦截器链
+        return protocol.export(builder.buildInvokerChain(invoker, SERVICE_FILTER_KEY, CommonConstants.PROVIDER)); // 出发 Dubbo 协议暴露
+    }
+```
+
+```java
+	public <T> Invoker<T> buildInvokerChain(final Invoker<T> originalInvoker, String key, String group) {
+        Invoker<T> last = originalInvoker;
+        URL url = originalInvoker.getUrl();
+        List<Filter> filters = ScopeModelUtil.getExtensionLoader(Filter.class, url.getScopeModel()).getActivateExtension(url, key, group);
+
+        if (!filters.isEmpty()) {
+            for (int i = filters.size() - 1; i >= 0; i--) {
+                final Filter filter = filters.get(i);
+                final Invoker<T> next = last; // 会把真实的 Invoker 服务对象 ref 放到拦截器的末尾
+                last = new FilterChainNode<>(originalInvoker, next, filter); 
+            }
+        }
+        return last;
+    }
+```
+
+```java
+	// FilterChainNode
+	public Result invoke(Invocation invocation) throws RpcException {
+            Result asyncResult;
+            try {
+                asyncResult = filter.invoke(nextNode, invocation); // 每次调用都会传递给下一个拦截器
+            } catch (Exception e) {
+                ...
+            } finally {
+
+            }
+            ...
+        }
+```
+
+​		整体逻辑：
+
+​				1、在触发`Dubbo`协议暴露前先对服务`Invoker`做了一层拦截器构建，在加载所有拦截器时会过滤只对`provider`生效的数据。
+
+​				2、首先获取真实服务`ref`对应的`Invoker`并挂载到整个拦截器链尾部，然后逐层包裹其他拦截器，这样保证了真实服务调用是最后触发的。
+
+​				3、逐层转发拦截器服务调用，是否调用下一个拦截器由具体拦截器实现。
+
+​		在构造调用拦截器之后会调用`Dubbo`协议进行服务暴露：
+
+```java
+	// DubboProtocol
+	public <T> Exporter<T> export(Invoker<T> invoker) throws RpcException {
+        checkDestroyed();
+        URL url = invoker.getUrl();
+
+        // export service.
+        String key = serviceKey(url); // 根据服务分组、版本、接口和端口构造 key
+        DubboExporter<T> exporter = new DubboExporter<T>(invoker, key, exporterMap);
+        exporterMap.put(key, exporter); //  把exporter存储到单例 DubboProtocol 中
+
+        ...
+
+        openServer(url); // 初次暴露会创建监听服务器
+        optimizeSerialization(url);
+
+        return exporter;
+    }
+
+	private ProtocolServer createServer(URL url) {
+        
+        ...
+
+        ExchangeServer server;
+        try {
+            server = Exchangers.bind(url, requestHandler); // 创建 NettyServer 并且初始化 Handler
+        } catch (RemotingException e) {
+            throw new RpcException("Fail to start server(url: " + url + ") " + e.getMessage(), e);
+        }
+
+        ...
+
+        DubboProtocolServer protocolServer = new DubboProtocolServer(server);
+        loadServerProperties(protocolServer);
+        return protocolServer;
+    }
+```
+
+​		整体逻辑：
+
+​				1、根据服务分组、版本、服务接口和暴露端口作为`key`用于关联具体服务`Invoker`。
+
+​				2、对服务暴露做校验判断，因为同一个协议暴露有很多接口，只有初次暴露的接口才需要打开端口监听
+
+​				3、触发`HeaderExchanger`中的绑定方法，最后会调用底层`NettyServer`进行处理。
+
+​		在初始化`Server`过程中会初始化很多`Handler`用于支持一些特性。
+
+
+
+## 本地服务暴露
+
+​		使用`Dubbo`框架的应用可能存在同一个`JVM`暴露了远程服务，同时同一个`JVM`内部又引用了自身服务的情况，`Dubbo`默认会把远程服务用`injvm`协议再暴露
+
+一份，这样消费方直接消费同一个`JVM`内部的服务，避免了跨网络进行远程通信：
+
+```java
+	// ServiceConfig
+	private void exportLocal(URL url) {
+        URL local = URLBuilder.from(url)
+                .setProtocol(LOCAL_PROTOCOL) // 显示指定 injvm 协议进行暴露
+                .setHost(LOCALHOST_VALUE)
+                .setPort(0)
+                .build();
+        local = local.setScopeModel(getScopeModel())
+            .setServiceModel(providerModel);
+        doExportUrl(local, false);
+        logger.info("Export dubbo service " + interfaceClass.getName() + " to local registry url : " + local);
+    }
+
+	private void doExportUrl(URL url, boolean withMetaData) {
+        Invoker<?> invoker = proxyFactory.getInvoker(ref, (Class) interfaceClass, url); // 调用 InjvmProtocol#export
+        if (withMetaData) {
+            invoker = new DelegateProviderMetaDataInvoker(invoker, this);
+        }
+        Exporter<?> exporter = protocolSPI.export(invoker);
+        exporters.add(exporter);
+    }
+```
+
+​		整体逻辑：
+
+​				1、`Dubbo`指定用`injvm`协议暴露服务，这个协议比较特殊，不会做端口打开操作，仅仅把服务保存在内存中而已。
+
+​				2、提取`URL`中的协议，在`InjvmProtocol`类中存储服务实例信息，它的实现也是非常直截了当的，直接返回`InjvmExporter`实例对象，构造函数内部会
+
+​		把当前`Invoker`加入`exporterMap`。
+
+```java
+	// InjvmProtocol
+	public <T> Exporter<T> export(Invoker<T> invoker) throws RpcException {
+        return new InjvmExporter<T>(invoker, invoker.getUrl().getServiceKey(), exporterMap);
+    }
+```
+
+```java
+public class InjvmExporter<T> extends AbstractExporter<T> {
+
+    ...
+
+    InjvmExporter(Invoker<T> invoker, String key, Map<String, Exporter<?>> exporterMap) {
+        super(invoker);
+        this.key = key;
+        this.exporterMap = exporterMap;
+        exporterMap.put(key, this);
+    }
+
+    ...
+
+}
+```
+
+
+
 # Hello World(注解开发)
 
 ​		服务端：
