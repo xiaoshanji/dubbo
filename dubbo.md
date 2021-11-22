@@ -1835,6 +1835,316 @@ public class InjvmExporter<T> extends AbstractExporter<T> {
 
 
 
+# 服务消费
+
+​		整体`RPC`的消费原理：
+
+![](image/QQ截图20211122091715.png)
+
+​		`Dubbo`框架做服务消费也分为两大部分：
+
+​				第一步通过持有远程服务实例生成`Invoker`，这个`Invoker`在客户端是核心的远程代理对象。
+
+​				第二步会把`Invoker`通过动态代理转换成实现用户接口的动态代理引用。这里的`Invoker`承载了网络连接、服务调用和重试等功能，在客户端，它可能
+
+​		是一个远程的实现，也可能是一个集群实现。
+
+​		`Dubbo`支持多注册中心同时消费，如果配置了服务同时注册多个注册中心，则会在`ReferenceConfig#createProxy`中合并成一个`Invoke`：
+
+```java
+	private T createProxy(Map<String, String> referenceParameters) {
+        if (shouldJvmRefer(referenceParameters)) {  // 处理在同一个 JVM 内部引用的情况
+            createInvokerForLocal(referenceParameters);
+        } else {
+            urls.clear();
+            if (url != null && url.length() > 0) {
+                // user specified URL, could be peer-to-peer address, or register center's address.
+                parseUrl(referenceParameters);
+            } else {
+                // if protocols not in jvm checkRegistry
+                if (!LOCAL_PROTOCOL.equalsIgnoreCase(getProtocol())) {
+                    aggregateUrlFromRegistry(referenceParameters);
+                }
+            }
+            createInvokerForRemote();
+        }
+
+        if (logger.isInfoEnabled()) {
+            logger.info("Referred dubbo service " + interfaceClass.getName());
+        }
+
+        URL consumerUrl = new ServiceConfigURL(CONSUMER_PROTOCOL, referenceParameters.get(REGISTER_IP_KEY), 0,
+            referenceParameters.get(INTERFACE_KEY), referenceParameters);
+        consumerUrl = consumerUrl.setScopeModel(getScopeModel());
+        consumerUrl = consumerUrl.setServiceModel(consumerModel);
+        MetadataUtils.publishServiceDefinition(consumerUrl);
+
+        // create service proxy
+        return (T) proxyFactory.getProxy(invoker, ProtocolUtils.isGeneric(generic));
+    }
+```
+
+```java
+	private void createInvokerForRemote() {
+        if (urls.size() == 1) {  // 单注册中心消费
+            URL curUrl = urls.get(0);
+            invoker = protocolSPI.refer(interfaceClass,curUrl);
+            if (!UrlUtils.isRegistry(curUrl)){
+                List<Invoker<?>> invokers = new ArrayList<>();
+                invokers.add(invoker);
+                invoker = Cluster.getCluster(scopeModel, Cluster.DEFAULT).join(new StaticDirectory(curUrl, invokers), true);
+            }
+        } else {
+            List<Invoker<?>> invokers = new ArrayList<>();
+            URL registryUrl = null;
+            for (URL url : urls) { // 逐个获取注册中心的服务，添加到 invokers 列表
+
+                invokers.add(protocolSPI.refer(interfaceClass, url));
+
+                if (UrlUtils.isRegistry(url)) {
+                    // use last registry url
+                    registryUrl = url;
+                }
+            }
+
+            if (registryUrl != null) {
+                
+                String cluster = registryUrl.getParameter(CLUSTER_KEY, ZoneAwareCluster.NAME);
+
+                invoker = Cluster.getCluster(registryUrl.getScopeModel(), cluster, false).join(new StaticDirectory(registryUrl, invokers), false); // 通过 Cluster 将多个 Invoker 转换成一个 Invoker
+            } else {
+                // not a registry url, must be direct invoke.
+                if (CollectionUtils.isEmpty(invokers)) {
+                    throw new IllegalArgumentException("invokers == null");
+                }
+                URL curUrl = invokers.get(0).getUrl();
+                String cluster = curUrl.getParameter(CLUSTER_KEY, Cluster.DEFAULT);
+                invoker = Cluster.getCluster(scopeModel, cluster).join(new StaticDirectory(curUrl, invokers), true);
+            }
+        }
+    }
+```
+
+​		整体逻辑：
+
+​				1、优先判断是否在同一个`JVM`中包含要消费的服务。
+
+​				2、找出内存中`injvm`协议的服务， 其实`injvm`协议是比较好理解的，前面提到服务实例都放到内存`map`中，消费也是直接获取实例调用而已。
+
+​				3、在注册中心中追加消费者元数据信息，应用启动时订阅注册中心、服务提供者参数等合并时会用到这部分信息。
+
+​				4、处理只有一个注册中心的场景，这种场景在客户端中是最常见的，客户端启动拉取服务元数据，订阅`provider`、路由和配置变更。
+
+​				5、分别处理多注册中心的场景。
+
+​		当经过注册中心消费时，主要通过`RegistryProtocol#refer`触发数据拉取、订阅和服务`Invoker`转换等操作：
+
+```java
+	public <T> Invoker<T> refer(Class<T> type, URL url) throws RpcException {
+        url = getRegistryUrl(url);  // 设置具体注册中心协议
+        Registry registry = getRegistry(url); // 创建注册中心实例
+        if (RegistryService.class.equals(type)) {
+            return proxyFactory.getInvoker((T) registry, type, url);
+        }
+
+        // group="a,b" or group="*"
+        Map<String, String> qs = (Map<String, String>) url.getAttribute(REFER_KEY); // 根据配置处理多分组结果聚合
+        String group = qs.get(GROUP_KEY);
+        if (group != null && group.length() > 0) {
+            if ((COMMA_SPLIT_PATTERN.split(group)).length > 1 || "*".equals(group)) {
+                return doRefer(Cluster.getCluster(url.getScopeModel(), MergeableCluster.NAME), registry, type, url, qs);
+            }
+        }
+
+        Cluster cluster = Cluster.getCluster(url.getScopeModel(), qs.get(CLUSTER_KEY));
+        return doRefer(cluster, registry, type, url, qs); // 处理订阅数据并通过 Cluster 合并多个 Invoker
+    }
+
+
+	protected <T> Invoker<T> doRefer(Cluster cluster, Registry registry, Class<T> type, URL url, Map<String, String> parameters) {
+        Map<String, Object> consumerAttribute = new HashMap<>(url.getAttributes());
+        consumerAttribute.remove(REFER_KEY);
+        URL consumerUrl = new ServiceConfigURL(parameters.get(PROTOCOL_KEY) == null ? DUBBO : parameters.get(PROTOCOL_KEY),
+            null,
+            null,
+            parameters.get(REGISTER_IP_KEY),
+            0, getPath(parameters, type),
+            parameters,
+            consumerAttribute);
+        url = url.putAttribute(CONSUMER_URL_KEY, consumerUrl);
+        ClusterInvoker<T> migrationInvoker = getMigrationInvoker(this, cluster, registry, type, url, consumerUrl);
+        return interceptInvoker(migrationInvoker, url, consumerUrl, url);
+    }
+```
+
+​		第一次发起订阅时会进行一次数据拉取操作，同时触发`RegistryDirectory#notify`方法，这里的通知数据是某一个类别的全量数据，当通知`providers`数据
+
+时，在`RegistryDirectory#toInvokers`方法内完成`Invoker`转换：
+
+```java
+	private Map<URL, Invoker<T>> toInvokers(Map<URL, Invoker<T>> oldUrlInvokerMap, List<URL> urls) {
+        Map<URL, Invoker<T>> newUrlInvokerMap = new ConcurrentHashMap<>();
+        if (urls == null || urls.isEmpty()) {
+            return newUrlInvokerMap;
+        }
+        String queryProtocols = this.queryMap.get(PROTOCOL_KEY);
+        for (URL providerUrl : urls) {
+
+            if (queryProtocols != null && queryProtocols.length() > 0) {
+                boolean accept = false;
+                String[] acceptProtocols = queryProtocols.split(",");
+                for (String acceptProtocol : acceptProtocols) { // 根据消费方protocol配置过滤不匹配协议
+                    if (providerUrl.getProtocol().equals(acceptProtocol)) {
+                        accept = true;
+                        break;
+                    }
+                }
+                if (!accept) {
+                    continue;
+                }
+            }
+            
+            ...
+                
+            URL url = mergeUrl(providerUrl); // 合并provider端配置数据
+
+
+            Invoker<T> invoker = oldUrlInvokerMap == null ? null : oldUrlInvokerMap.remove(url);
+            if (invoker == null) { // Not in the cache, refer again
+                try {
+                    boolean enabled = true;
+                    
+                    ...
+                    
+                    if (enabled) {
+                        invoker = protocol.refer(serviceType, url); // 使用具体协议创建远程连接
+                    }
+                } catch (Throwable t) {
+                    logger.error("Failed to refer invoker for interface:" + serviceType + ",url:(" + url + ")" + t.getMessage(), t);
+                }
+                if (invoker != null) { // Put new invoker in cache
+                    newUrlInvokerMap.put(url, invoker);
+                }
+            } else {
+                newUrlInvokerMap.put(url, invoker);
+            }
+        }
+        return newUrlInvokerMap;
+    }
+```
+
+​		1、进行协议处理，支持消费多个协议，允许消费多个协议时，在配置`Protocol`值时用逗号分隔即可。
+
+​		2、消费信息是客户端处理的，需要合并服务端相关信息，通过注册中心获取这些信息，解耦了消费方强绑定配置。
+
+​		3、消除重复推送的服务列表，防止重复引用。
+
+​		4、使用具体的协议发起远程连接等操作。
+
+​		具体`Invoker`创建是在`DubboProtocol#refer`中实现的，`Dubbo`协议在返回`Dubbolnvoker`对象之前会先初始化客户端连接对象。`Dubbo`支持客户端是否立即
+
+和远程服务建立`TCP`连接是由参数是否配置了`lazy`属性决定的，默认会全部连接。`DubboProtocol#refer`内部会调用`DubboProtocol#initClient`负责建立客户端
+
+连接和初始化`Handle`：
+
+```java
+	private ExchangeClient initClient(URL url) {
+
+       ...
+
+        ExchangeClient client;
+        try {
+            // connection should be lazy
+            if (url.getParameter(LAZY_CONNECT_KEY, false)) {
+                client = new LazyConnectExchangeClient(url, requestHandler); // 如果配置了 lazy属性，则真实调用才会创建TCP连接
+
+            } else {
+                client = Exchangers.connect(url, requestHandler); // 立即与远程连接
+            }
+
+        } catch (RemotingException e) {
+            throw new RpcException("Fail to create remoting client for service(" + url + "): " + e.getMessage(), e);
+        }
+
+        return client;
+    }
+```
+
+​		1、支持`lazy`延迟连接，在真实发生`RPC`调用时创建。
+
+​		2、立即发起远程`TCP`连接，具体使用底层传输也是根据配置`transporter`决定的，默认是`Netty`传输。
+
+​		3、会触发`HeaderExchanger#connect`调用，用于支持心跳和在业务线程中编解码`Handler`，最终会调用`Transporters#connect`生成`Netty`客户端处理。
+
+
+
+​		多注册中心消费原理比较简单，每个单独注册中心抽象成一个单独的`Invoker`，多个注册中心实例最终通过`StaticDirectory`保存所有的`Invoker`，最终通过
+
+`Cluster`合并成一个`Invoker`。
+
+​		在多注册中心场景下，默认使用的集群策略是`available`：
+
+```java
+public class AvailableCluster implements Cluster {
+
+    public static final String NAME = "available";
+
+    @Override
+    public <T> Invoker<T> join(Directory<T> directory, boolean buildFilterChain) throws RpcException {
+        return new AvailableClusterInvoker<>(directory);
+    }
+
+}
+
+public class AvailableClusterInvoker<T> extends AbstractClusterInvoker<T> {
+
+    public AvailableClusterInvoker(Directory<T> directory) {
+        super(directory);
+    }
+
+    @Override
+    public Result doInvoke(Invocation invocation, List<Invoker<T>> invokers, LoadBalance loadbalance) throws RpcException {
+        for (Invoker<T> invoker : invokers) { // invokers 注册中心实例
+            if (invoker.isAvailable()) { // 判断特定注册中心是否包含 provider 服务
+                return invokeWithContext(invoker, invocation);
+            }
+        }
+        throw new RpcException("No provider available in " + invokers);
+    }
+
+}
+```
+
+​		1、`dolnvoke`实际持有的`invokers`列表是注册中心实例。
+
+​		2、判断具体注册中心中是否有服务可用，这里发起的`invoke`实际上会通过注册中心`RegistryDirectory`获取真实`provider`机器列表进行路由和负载均衡调
+
+用。
+
+
+
+​		`Dubbo`可以绕过注册中心直接向指定服务发起`RPC`调用。`Dubbo`框架也支持同时指定直连多台机器进行服务调用：
+
+
+
+​		`Dubbo`中实现的优雅停机机制主要包含`6`个步骤：
+
+​				1、收到`kill -9`进程退出信号，`Spring`容器会触发容器销毁事件。
+
+​				2、`provider`端会取消注册服务元数据信息。
+
+​				3、`consumer`端会收到最新地址列表。
+
+​				4、`Dubbo`协议会发送`readonly`事件报文通知`consumer`服务不可用。
+
+​				5、服务端等待已经执行的任务结束并拒绝新任务执行。 
+
+
+
+
+
+
+
 # Hello World(注解开发)
 
 ​		服务端：
