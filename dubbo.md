@@ -2143,6 +2143,677 @@ public class AvailableClusterInvoker<T> extends AbstractClusterInvoker<T> {
 
 
 
+# 远程调用
+
+​		`Dubbo`在一次完整的`RPC`调用流程中经过的步骤：
+
+![](image/QQ截图20211123091002.png)
+
+​		首先在客户端启动时会从注册中心拉取和订阅对应的服务列表，`Cluster`会把拉取的服务列表聚合成一个`Invoker`，每次`RPC`调用前会通过`Directory#list`
+
+获取`providers`地址`(`已经生成好的`Invoker`列表`)`，获取这些服务列表给后续路由和负载均衡使用。在框架内部另外一个实现`Directory`接口是
+
+`RegistryDirectory`类，它和接口名是一对一的关系`(`每一个接口都有一个`RegistryDirectory`实例`)`，主要负责拉取和订阅服务提供者、动态配置和路由项。 
+
+​		在`Dubbo`发起服务调用时，所有路由和负载均衡都是在客户端实现的。客户端服务调用首先会触发路由操作，然后将路由结果得到的服务列表作为负载均衡
+
+参数，经过负载均衡后会选出一台机器进行`RPC`调用。客户端经过路由和负载均衡后，会将请求交给底层`I/O`线程池，`I/O`线程池主要处理读写、序列化和反序列 
+
+化等逻辑，因此这里一定不能阻塞操作，`Dubbo`也提供参数控制`decode.in.io`参数，在处理反序列化对象时会在业务线程池中处理。`Dubbo`包含两种类似的线程
+
+池，一种是`I/O`线程池`(Netty)`，另一种是`Dubbo`业务线程池`(`承载业务方法调用`)`。
+
+​		`Dubbo`将服务调用和`Telnet`调用做了端口复用，在编解码层面也做了适配。在`Telnet`调用时，会新建立一个`TCP`连接，传递接口、方法和`JSON`格式的参数
+
+进行服务调用，在编解码层面简单读取流中的字符串，最终交给`Telnet`对应的`Handler`去解析方法调用。如果是非`Telnet`调用，则服务提供方会根据传递过来的
+
+接口、分组和版本信息查找`Invoker`对应的实例进行反射调用。`Telnet`和正常`RPC`调用不一样的地方是序列化和反序列化使用的不是`Hessian`方式，而是直接使
+
+用`fastjson`进行处理。
+
+
+
+## Dubbo协议
+
+![](image/QQ截图20211123093327.png)
+
+| 偏移比特位 |   字段描述   |                             作用                             |
+| :--------: | :----------: | :----------------------------------------------------------: |
+|    0〜7    |   魔数高位   |                 存储的是魔法数高位`(OxdaOO)`                 |
+|   8〜15    |   魔数低位   |                  存储的是魔法数低位`(Oxbb)`                  |
+|     16     |  数据包类型  | 是否为双向的`RPC`调用`(`比如方法调用有返回值`)`，`0`为`Response`，`1`为`Request` |
+|     17     |   调用方式   | 仅在第`16`位被设为`1`的情况下有效，`0`为单向调用，`1`为双向调用 |
+|     18     |   事件标识   | `0`为当前数据包是请求或响应包<br />`1`为当前数据包是心跳包，框架为了保活TCP连接，每次客户端和服务端互相发送心跳包时这个标志位被设定设置了心跳报文不会透传到业务方法调用，仅用于框架内部保活机制 |
+|   19〜23   | 序列化器编号 | `2`为`Hessian2Serialization`<br /> `3`为`JavaSerialization`<br /> `4`为`CompactedJavaSerialization`<br /> `6`为`FastJsonSerialization`<br />`7`为`NativeJavaSerialization`<br />`8`为`KryoSerialization`<br />`9`为`FstSerialization` |
+|   24〜31   |     状态     |                            状态码                            |
+|   32〜95   |   请求编号   |  这`8`个字节存储`RPC`请求的唯一`id`，用来将请求和响应做关联  |
+|  96〜127   |  消息体长度  | 占用的`4`个字节存储消息体长度。在一次`RPC`请求过程中，消息体中依次会存储`7`部分内容 |
+
+​		在消息体中，客户端严格按照序列化顺序写入消息，服务端也会遵循相同的顺序读取消息，客户端发起请求的消息体依次保存下列内容：`Dubbo`版本号、服
+
+务接口名、服务接口版本、方法名、参数类型、方法参数值和请求额外参数。
+
+​		完整状态响应码和作用：
+
+| 状态值 |             状态符号              |          作用          |
+| :----: | :-------------------------------: | :--------------------: |
+|   20   |                OK                 |        正确返回        |
+|   30   |          CLIENT_TIMEOUT           |       客户端超时       |
+|   31   |          SERVER_TIMEOUT           |       服务端超时       |
+|   40   |            BAD_REQUEST            |    请求报文格式错误    |
+|   50   |           BAD_RESPONSE            |    响应报文格式错误    |
+|   60   |         SERVICE_NOT_FOUND         |    未找到匹配的服务    |
+|   70   |           SERVICE_ERROR           |      服务调用错误      |
+|   80   |           SERVER_ERROR            |     服务端内部错误     |
+|   90   |           CLIENT_ERROR            |       客户端错误       |
+|  100   | SERVER_THREADPOOL_EXHAUSTED_ERROR | 服务端线程池满拒绝执行 |
+
+​		状态响主要根据以下标记判断返回值：
+
+| 状态值 |                 状态符号                 |         作用         |
+| :----: | :--------------------------------------: | :------------------: |
+|   5    |   RESPONSE_NULL_VALUE_WITH_ATTACHMENTS   | 响应空值包含隐藏参数 |
+|   4    |     RESPONSE_VALUE_WITH_ATTACHMENTS      | 响应结果包含隐藏参数 |
+|   3    | RESPONSE_WITH_EXCEPTION_WITH_ATTACHMENTS | 异常返回包含隐藏参数 |
+|   2    |           RESPONSE_NULL_VALUE            |       响应空值       |
+|   1    |              RESPONSE_VALUE              |       响应结果       |
+|   0    |         RESPONSE_WITH_EXCEPTION          |       异常返回       |
+
+​		在返回消息体中，会先把返回值状态标记写入输出流，根据标记状态判断`RPC`是否正常，紧接着再写方法返回值。
+
+​		客户端会使用多线程并发调用服务，`Dubbo`做到正确响应调用线程的关键点在于协议头全局请求`id`标识：
+
+![](image/QQ截图20211123095831.png)
+
+​		当客户端多个线程并发请求时，框架内部会调用`DefaultFuture`对象的`get`方法进行等待。 在请求发起时，框架内部会创建`Request`对象，这个时候会被分
+
+配一个唯一`id`，`DefaultFuture`可以从`Request`对象中获取`id`，并将关联关系存储到静态`HashMap`中。当客户端收到响应时，会根据`Response`对象中的`id`，从
+
+`Futures`集合中查找对应`DefaultFuture`对象，最终会唤醒对应的线程并通知结果。客户端也会启动一个定时扫描线程去探测超时没有返回的请求。
+
+
+
+## 编解码器
+
+![](image/QQ截图20211123101034.png)
+
+​		`AbstractCodec`主要提供基础能力，比如校验报文长度和查找具体编解码器等。`TransportCodec`主要抽象编解码实现，自动帮我们去调用序列化、反序列实
+
+现和自动`cleanup`流。通过`Dubbo`编解码继承结构可以清晰看到，`DubboCodec`继承自`ExchangeCodec`，它又再次继承了`TelnetCodec`实现。`Telnet`实现复用了
+
+`Dubbo`协议端口，其实就是在这层编解码做了通用处理。因为流中可能包含多个`RPC`请求，`Dubbo`框架尝试一次性读取更多完整报文编解码生成对象
+
+`(DubboCountCodec)`，它的实现思想比较简单，依次调用`DubboCodec`去解码，如果能解码成完整报文，则加入消息列表，然后触发下一个`Handler`方法调用。
+
+
+
+### 编码
+
+​		`Dubbo`中的编码器主要将`Java`对象编码成字节流返回给客户端，主要做两部分事情，构造报文头部，然后对消息体进行序列化处理。所有编解码层实现都继
+
+承自`Exchangecodec`。当`Dubbo`协议编码请求对象时，会调用`ExchangeCodec#encode`方法。
+
+```java
+	protected void encodeRequest(Channel channel, ChannelBuffer buffer, Request req) throws IOException {
+        Serialization serialization = getSerialization(channel, req); // 获取指定或默认的序列化协议
+        // header.
+        byte[] header = new byte[HEADER_LENGTH]; // 构造 16 字节头
+        // set magic number.
+        Bytes.short2bytes(MAGIC, header); //占用 2 个字节存储魔法数
+
+        // set request and serialization flag.
+        header[2] = (byte) (FLAG_REQUEST | serialization.getContentTypeId()); // 在第 3 个字节(16位和19〜23位)分别存储请求标志和序列化协议序号
+
+        if (req.isTwoWay()) {
+            header[2] |= FLAG_TWOWAY; // 设置请求/响应标记
+        }
+        if (req.isEvent()) {
+            header[2] |= FLAG_EVENT; 
+        }
+
+        // set request id.
+        Bytes.long2bytes(req.getId(), header, 4); // 设置请求唯一标识
+
+        // encode request data.
+        int savedWriteIndex = buffer.writerIndex();
+        buffer.writerIndex(savedWriteIndex + HEADER_LENGTH); // 跳过 buffer 头部 16 个字节，用于序列化消息体
+        ChannelBufferOutputStream bos = new ChannelBufferOutputStream(buffer);
+
+        if (req.isHeartbeat()) {
+            // heartbeat request data is always null
+            bos.write(CodecSupport.getNullBytesOf(serialization));
+        } else {
+            ObjectOutput out = serialization.serialize(channel.getUrl(), bos);
+            if (req.isEvent()) {
+                encodeEventData(channel, out, req.getData());
+            } else {
+                encodeRequestData(channel, out, req.getData(), req.getVersion()); // 序列化请求调用,data 一般是 Rpclnvocation
+            }
+            out.flushBuffer();
+            if (out instanceof Cleanable) {
+                ((Cleanable) out).cleanup();
+            }
+        }
+
+        bos.flush();
+        bos.close();
+        int len = bos.writtenBytes();
+        checkPayload(channel, len); // 检车是否超过默认 8MB 大小
+        Bytes.int2bytes(len, header, 12); // 向消息长度写入头部第 12 个字节的偏移量(96〜127位)
+
+        // write
+        buffer.writerIndex(savedWriteIndex); // 定位指针到报文头部开始位
+        buffer.writeBytes(header); // 写入完整报文头部到 buffer
+        buffer.writerIndex(savedWriteIndex + HEADER_LENGTH + len); // 设置 writerindex 到消息体结束位置
+    }
+```
+
+​		上面调用了`encodeRequestData`方法对`Rpclnvocation`调用进行编码，这部分主要就是对接口、方法、方法参数类型、方法参数等进行编码，在
+
+`DubboCodec#encodeRequestData`中重写了这个方法实现：
+
+```java
+    protected void encodeRequestData(Channel channel, ObjectOutput out, Object data, String version) throws IOException {
+        RpcInvocation inv = (RpcInvocation) data;
+
+        out.writeUTF(version); // 写入框架版本，主要用于支持服务端版本隔离和服务端隐式参数透传给客户端的特性
+
+        String serviceName = inv.getAttachment(INTERFACE_KEY);
+        if (serviceName == null) {
+            serviceName = inv.getAttachment(PATH_KEY); 
+        }
+        out.writeUTF(serviceName); // // 写入调用接口
+        out.writeUTF(inv.getAttachment(VERSION_KEY)); // 写入接口指定的版本，默认为 0.0.0。Dubbo允许同一个接口有多个实现，可以指定版本或分组来区分
+
+        out.writeUTF(inv.getMethodName()); // 写入方法名称
+        out.writeUTF(inv.getParameterTypesDesc()); // 写入方法参数类型
+        Object[] args = inv.getArguments();
+        if (args != null) {
+            for (int i = 0; i < args.length; i++) {
+                out.writeObject(callbackServiceCodec.encodeInvocationArgument(channel, inv, i)); // 依次写入方法参数值
+            }
+        }
+        out.writeAttachments(inv.getObjectAttachments()); // 写入隐式参数
+    }
+```
+
+
+
+​		编码响应对象，实现在`ExchangeCodec#encodeResponse`中：
+
+```java
+	protected void encodeResponse(Channel channel, ChannelBuffer buffer, Response res) throws IOException {
+        int savedWriteIndex = buffer.writerIndex();
+        try {
+            Serialization serialization = getSerialization(channel, res); // 获取指定或默认的序列化协议
+            // header.
+            byte[] header = new byte[HEADER_LENGTH]; // 构造 16 字节头
+            // set magic number.
+            Bytes.short2bytes(MAGIC, header); // 占用2个字节存储魔法数
+            // set request and serialization flag.
+            header[2] = serialization.getContentTypeId(); // 在第3个字节（19〜23位）存储响应标志
+            if (res.isHeartbeat()) {
+                header[2] |= FLAG_EVENT;
+            }
+            // set response status.
+            byte status = res.getStatus(); // 在第4个字节存储响应状态
+            header[3] = status;
+            // set request id.
+            Bytes.long2bytes(res.getId(), header, 4); // 设置请求唯一标识
+
+            buffer.writerIndex(savedWriteIndex + HEADER_LENGTH); // 空出 16 字节头部用于存储响应体报文
+            ChannelBufferOutputStream bos = new ChannelBufferOutputStream(buffer);
+
+            // encode response data or error message.
+            if (status == Response.OK) {
+                if(res.isHeartbeat()){
+                    // heartbeat response data is always null
+                    bos.write(CodecSupport.getNullBytesOf(serialization));
+                }else {
+                    ObjectOutput out = serialization.serialize(channel.getUrl(), bos);
+                    if (res.isEvent()) {
+                        encodeEventData(channel, out, res.getResult());
+                    } else {
+                        encodeResponseData(channel, out, res.getResult(), res.getVersion()); // 序列化响应调用，data 一般是 Result 对象
+                    }
+                    out.flushBuffer();
+                    if (out instanceof Cleanable) {
+                        ((Cleanable) out).cleanup();
+                    }
+                }
+            } else {
+                ObjectOutput out = serialization.serialize(channel.getUrl(), bos);
+                out.writeUTF(res.getErrorMessage());
+                out.flushBuffer();
+                if (out instanceof Cleanable) {
+                    ((Cleanable) out).cleanup();
+                }
+            }
+
+            bos.flush();
+            bos.close();
+
+            int len = bos.writtenBytes();
+            checkPayload(channel, len); // 检查是否超过默认的 8MB 大小
+            Bytes.int2bytes(len, header, 12); // 向消息长度写入头部第 12 个字节偏移量(96 ~ 127 位)
+            // write
+            buffer.writerIndex(savedWriteIndex); // 定位指针到报文头部开始位置
+            buffer.writeBytes(header); // 写入完整报文头部到 buffer
+            buffer.writerIndex(savedWriteIndex + HEADER_LENGTH + len); // 设置 writerindex 到消息体结束位置
+        } catch (Throwable t) {
+            // clear buffer
+            buffer.writerIndex(savedWriteIndex); // 如果编码失败，则复位 buffer,否则导致缓冲区中数据错乱
+            // send error message to Consumer, otherwise, Consumer will wait till timeout.
+            if (!res.isEvent() && res.getStatus() != Response.BAD_RESPONSE) { // 将编码响应异常发送给 consumer,否则只能等待到超时
+                Response r = new Response(res.getId(), res.getVersion());
+                r.setStatus(Response.BAD_RESPONSE);
+
+                if (t instanceof ExceedPayloadLimitException) {
+                    logger.warn(t.getMessage(), t);
+                    try {
+                        r.setErrorMessage(t.getMessage());
+                        channel.send(r); // 告知客户端数据包长度超过限制
+                        return;
+                    } catch (RemotingException e) {
+                        logger.warn("Failed to send bad_response info back: " + t.getMessage() + ", cause: " + e.getMessage(), e);
+                    }
+                } else {
+                    // FIXME log error message in Codec and handle in caught() of IoHanndler?
+                    logger.warn("Fail to encode response: " + res + ", send bad_response info instead, cause: " + t.getMessage(), t);
+                    try {
+                        // 告知客户端编码失败的具体原因
+                        r.setErrorMessage("Failed to send response: " + res + ", cause: " + StringUtils.toString(t)); 
+                        channel.send(r);
+                        return;
+                    } catch (RemotingException e) {
+                        logger.warn("Failed to send bad_response info back: " + res + ", cause: " + e.getMessage(), e);
+                    }
+                }
+            }
+
+            ...
+        }
+    }
+```
+
+​		编码响应消息体的部分实现在`DubboCodec#encodeResponseData`中：
+
+```java
+	protected void encodeResponseData(Channel channel, ObjectOutput out, Object data, String version) throws IOException {
+        Result result = (Result) data;
+        // currently, the version value in Response records the version of Request
+        boolean attach = Version.isSupportResponseAttachment(version); // 判断客户端请求的版本是否支持服务端参数返回
+        Throwable th = result.getException();
+        if (th == null) {
+            Object ret = result.getValue(); // 提取正常返回结果
+            if (ret == null) {
+                out.writeByte(attach ? RESPONSE_NULL_VALUE_WITH_ATTACHMENTS : RESPONSE_NULL_VALUE); // 在编码结果前，先写一个字节标志
+            } else {
+                out.writeByte(attach ? RESPONSE_VALUE_WITH_ATTACHMENTS : RESPONSE_VALUE);
+                out.writeObject(ret); // 分别写一个字节标记和调用结果
+            }
+        } else {
+            out.writeByte(attach ? RESPONSE_WITH_EXCEPTION_WITH_ATTACHMENTS : RESPONSE_WITH_EXCEPTION);
+            out.writeThrowable(th); // 标记调用抛异常，并序列化异常
+        }
+
+        if (attach) {
+            // returns current version of Response to consumer side.
+            result.getObjectAttachments().put(DUBBO_VERSION_KEY, Version.getProtocolVersion()); 
+            out.writeAttachments(result.getObjectAttachments()); // 记录服务端 Dubbo 版本，并返回服务端隐式参数
+        }
+    }
+```
+
+
+
+### 解码
+
+​		解码工作分为`2`部分，第`1`部分解码报文的头部`(16`字节`)`，第`2`部分解码报文体内容，以及如何把报文体转换成`Rpclnvocation`。
+
+​		当服务端读取流进行解码时，会触发`ExchangeCodec#decode`方法，`Dubbo`协议解码继承了这个类实现，但是在解析消息体时，`Dubbo`协议重写了`decodeBody`
+
+方法：
+
+```java
+	public Object decode(Channel channel, ChannelBuffer buffer) throws IOException {
+        int readable = buffer.readableBytes();
+        byte[] header = new byte[Math.min(readable, HEADER_LENGTH)]; // 最多读取 16 个字节，并分配存储空间
+        buffer.readBytes(header);
+        return decode(channel, buffer, readable, header);
+    }
+
+	protected Object decode(Channel channel, ChannelBuffer buffer, int readable, byte[] header) throws IOException {
+        // check magic number.
+        if (readable > 0 && header[0] != MAGIC_HIGH
+                || readable > 1 && header[1] != MAGIC_LOW) { // 处理流起始处不是 Dubbo 魔法数 Oxdabb 场景
+            int length = header.length;
+            if (header.length < readable) { // 流中还有数据可以读取
+                header = Bytes.copyOf(header, readable); // 为 header 重新分配空间，用来存储流中所有可读字节
+                buffer.readBytes(header, length, readable - length); // 将流中剩余字节读取到 header 中
+            }
+            for (int i = 1; i < header.length - 1; i++) {
+                if (header[i] == MAGIC_HIGH && header[i + 1] == MAGIC_LOW) {
+                    buffer.readerIndex(buffer.readerIndex() - header.length + i); // 将 buffer 读索引指向回 Dubbo 报文开头处 (Oxdabb)
+                    header = Bytes.copyOf(header, i); // 将流起始处至下一个 Dubbo 报文之间的数据放到 header 中
+                    break;
+                }
+            }
+            return super.decode(channel, buffer, readable, header); // 主要用于解析 header 数据，比如用于 Telnet
+        }
+        // check length.
+        if (readable < HEADER_LENGTH) { // 如果读取数据长度小于 16 个字节,则期待更多数据
+            return DecodeResult.NEED_MORE_INPUT;
+        }
+
+        // get data length.
+        int len = Bytes.bytes2int(header, 12); // 取头部存储的报文长度，并校验长度是否超过限制
+
+        // When receiving response, how to exceed the length, then directly construct a response to the client.
+        // see more detail from https://github.com/apache/dubbo/issues/7021.
+        Object obj = finishRespWhenOverPayload(channel, len, header);
+        if (null != obj) {
+            return obj;
+        }
+
+        checkPayload(channel, len);
+
+        int tt = len + HEADER_LENGTH;
+        if (readable < tt) { // 校验是否可以读取完整 Dubbo 报文，否则期待更多数据
+            return DecodeResult.NEED_MORE_INPUT;
+        }
+
+        // limit input stream.
+        ChannelBufferInputStream is = new ChannelBufferInputStream(buffer, len);
+
+        try {
+            return decodeBody(channel, is, header); // 解码消息体，is 流是完整的 RPC 调用报文
+        } finally {
+            if (is.available() > 0) { // 如果解码过程有问题，则跳过这次 RPC 调用报文
+                try {
+                    if (logger.isWarnEnabled()) {
+                        logger.warn("Skip input stream " + is.available());
+                    }
+                    StreamUtils.skipUnusedStream(is);
+                } catch (IOException e) {
+                    logger.warn(e.getMessage(), e);
+                }
+            }
+        }
+    }
+```
+
+​		处理消息体解码，这个是强协议相关的，因此`Dubbo`协议重写了这部分实现：
+
+```java
+	protected Object decodeBody(Channel channel, InputStream is, byte[] header) throws IOException {
+        byte flag = header[2], proto = (byte) (flag & SERIALIZATION_MASK);
+        // get request id.
+        long id = Bytes.bytes2long(header, 4);
+        if ((flag & FLAG_REQUEST) == 0) {
+            
+            ...
+                
+        } else {
+            // decode request.
+            Request req = new Request(id); // 请求标志位被设置，创建Request对象
+            req.setVersion(Version.getProtocolVersion());
+            req.setTwoWay((flag & FLAG_TWOWAY) != 0);
+            if ((flag & FLAG_EVENT) != 0) {
+                req.setEvent(true);
+            }
+            try {
+                Object data;
+                if (req.isEvent()) {
+                    byte[] eventPayload = CodecSupport.getPayload(is);
+                    if (CodecSupport.isHeartBeat(eventPayload, proto)) {
+                        // heart beat response data is always null;
+                        data = null;
+                    } else {
+                        data = decodeEventData(channel, CodecSupport.deserialize(channel.getUrl(), new ByteArrayInputStream(eventPayload), proto), eventPayload);
+                    }
+                } else {
+                    data = decodeRequestData(channel, CodecSupport.deserialize(channel.getUrl(), is, proto)); // 解码
+                }
+                req.setData(data); // 将 Rpclnvocation 作为 Request 的数据域
+            } catch (Throwable t) {
+                // bad request
+                req.setBroken(true); // 码失败，先做标记并存储异常
+                req.setData(t);
+            }
+            return req;
+        }
+    }
+```
+
+​		心跳和事件的解码，这两种解码非常简单，心跳报文是没有消息体的， 事件有消息体，在使用`Hessian2`协议的情况下默认会传递字符`R`，当优雅停机时会通
+
+过发送`readonly`事件来通知客户端服务端不可用。
+
+​		把消息体转换成`Rpclnvocation`对象，具体解码会触发`DecodeableRpcInvocation#decode`方法：
+
+```java
+	public Object decode(Channel channel, InputStream input) throws IOException {
+        ObjectInput in = CodecSupport.getSerialization(channel.getUrl(), serializationType)
+            .deserialize(channel.getUrl(), input);
+        this.put(SERIALIZATION_ID_KEY, serializationType);
+
+        String dubboVersion = in.readUTF(); // 读取框架版本
+        request.setVersion(dubboVersion);
+        setAttachment(DUBBO_VERSION_KEY, dubboVersion);
+
+        String path = in.readUTF();
+        setAttachment(PATH_KEY, path); // 读取调用接口
+        String version = in.readUTF();
+        setAttachment(VERSION_KEY, version); // 读取接口指定的版本,默认为0.0.0
+
+        setMethodName(in.readUTF()); // 读取方法名称
+
+        String desc = in.readUTF(); // 读取方法参数类型
+        setParameterTypesDesc(desc);
+
+        ClassLoader originClassLoader = Thread.currentThread().getContextClassLoader();
+        try {
+            if (Boolean.parseBoolean(System.getProperty(SERIALIZATION_SECURITY_CHECK_KEY, "true"))) {
+                CodecSupport.checkSerialization(frameworkModel.getServiceRepository(), path, version, serializationType);
+            }
+            Object[] args = DubboCodec.EMPTY_OBJECT_ARRAY;
+            Class<?>[] pts = DubboCodec.EMPTY_CLASS_ARRAY;
+            if (desc.length() > 0) {
+//                if (RpcUtils.isGenericCall(path, getMethodName()) || RpcUtils.isEcho(path, getMethodName())) {
+//                    pts = ReflectUtils.desc2classArray(desc);
+//                } else {
+                FrameworkServiceRepository repository = frameworkModel.getServiceRepository();
+                List<ProviderModel> providerModels = repository.lookupExportedServicesWithoutGroup(keyWithoutGroup(path, version));
+                ServiceDescriptor serviceDescriptor = null;
+                if (CollectionUtils.isNotEmpty(providerModels)) {
+                    for (ProviderModel providerModel : providerModels) {
+                        serviceDescriptor = providerModel.getServiceModel();
+                        if (serviceDescriptor != null) {
+                            break;
+                        }
+                    }
+                }
+                if (serviceDescriptor == null) {
+                    // Unable to find ProviderModel from Exported Services
+                    for (ApplicationModel applicationModel : frameworkModel.getApplicationModels()) {
+                        for (ModuleModel moduleModel : applicationModel.getModuleModels()) {
+                            serviceDescriptor = moduleModel.getServiceRepository().lookupService(path);
+                            if (serviceDescriptor != null) {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (serviceDescriptor != null) {
+                    MethodDescriptor methodDescriptor = serviceDescriptor.getMethod(getMethodName(), desc);
+                    if (methodDescriptor != null) {
+                        pts = methodDescriptor.getParameterClasses();
+                        this.setReturnTypes(methodDescriptor.getReturnTypes());
+
+                        // switch TCCL
+                        if (CollectionUtils.isNotEmpty(providerModels)) {
+                            if (providerModels.size() == 1) {
+                                Thread.currentThread().setContextClassLoader(providerModels.get(0).getClassLoader());
+                            } else {
+                                // try all providerModels' classLoader can load pts, use the first one
+                                for (ProviderModel providerModel : providerModels) {
+                                    ClassLoader classLoader = providerModel.getClassLoader();
+                                    boolean match = true;
+                                    for (Class<?> pt : pts) {
+                                        try {
+                                            if (!pt.equals(classLoader.loadClass(pt.getName()))) {
+                                                match = false;
+                                            }
+                                        } catch (ClassNotFoundException e) {
+                                            match = false;
+                                        }
+                                    }
+                                    if (match) {
+                                        Thread.currentThread().setContextClassLoader(classLoader);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (pts == DubboCodec.EMPTY_CLASS_ARRAY) {
+                    if (!RpcUtils.isGenericCall(desc, getMethodName()) && !RpcUtils.isEcho(desc, getMethodName())) {
+                        throw new IllegalArgumentException("Service not found:" + path + ", " + getMethodName());
+                    }
+                    pts = ReflectUtils.desc2classArray(desc);
+                }
+//                }
+
+                args = new Object[pts.length];
+                for (int i = 0; i < args.length; i++) {
+                    try {
+                        args[i] = in.readObject(pts[i]); // 依次读取方法参数值
+                    } catch (Exception e) {
+                        if (log.isWarnEnabled()) {
+                            log.warn("Decode argument failed: " + e.getMessage(), e);
+                        }
+                    }
+                }
+            }
+            setParameterTypes(pts);
+
+            Map<String, Object> map = in.readAttachments(); // 读取隐式参数
+            if (map != null && map.size() > 0) {
+                Map<String, Object> attachment = getObjectAttachments();
+                if (attachment == null) {
+                    attachment = new HashMap<>();
+                }
+                attachment.putAll(map);
+                setObjectAttachments(attachment);
+            }
+
+            //decode argument ,may be callback
+            for (int i = 0; i < args.length; i++) { 
+                // 处理异步参数回调，如果有则在服务端创建 reference 代理实例,为了支持异步参数回调，因为参数是回调客户端方法，所以需要在服务端创建客户端连接代理
+                args[i] = callbackServiceCodec.decodeInvocationArgument(channel, this, pts, i, args[i]);
+            }
+
+            setArguments(args);
+            String targetServiceName = buildKey((String) getAttachment(PATH_KEY),
+                getAttachment(GROUP_KEY),
+                getAttachment(VERSION_KEY));
+            setTargetServiceUniqueName(targetServiceName);
+        } catch (ClassNotFoundException e) {
+            throw new IOException(StringUtils.toString("Read invocation data failed.", e));
+        } finally {
+            Thread.currentThread().setContextClassLoader(originClassLoader);
+            if (in instanceof Cleanable) {
+                ((Cleanable) in).cleanup();
+            }
+        }
+        return this;
+    }
+```
+
+​		解码响应和解码请求类似，解码响应会调用`DubboCodec#decodeBody`方法。当方法调用返回时，会触发`DecodeableRpcResult#decode`方法调用：
+
+```java
+	public Object decode(Channel channel, InputStream input) throws IOException {
+        
+        ...
+        
+        ObjectInput in = CodecSupport.getSerialization(channel.getUrl(), serializationType)
+                .deserialize(channel.getUrl(), input);
+
+        byte flag = in.readByte();
+        switch (flag) {
+            case DubboCodec.RESPONSE_NULL_VALUE: // 返回结果标记为 Null 值
+                break;
+            case DubboCodec.RESPONSE_VALUE:
+                handleValue(in);
+                break;
+            case DubboCodec.RESPONSE_WITH_EXCEPTION:
+                handleException(in);
+                break;
+            case DubboCodec.RESPONSE_NULL_VALUE_WITH_ATTACHMENTS:
+                handleAttachment(in);
+                break;
+            case DubboCodec.RESPONSE_VALUE_WITH_ATTACHMENTS:
+                handleValue(in);
+                handleAttachment(in);
+                break;
+            case DubboCodec.RESPONSE_WITH_EXCEPTION_WITH_ATTACHMENTS:
+                handleException(in);
+                handleAttachment(in);
+                break;
+            default: // 其他类似隐式参数的读取
+                throw new IOException("Unknown result flag, expect '0' '1' '2' '3' '4' '5', but received: " + flag);
+        }
+        if (in instanceof Cleanable) {
+            ((Cleanable) in).cleanup();
+        }
+        return this;
+    }
+
+	private void handleValue(ObjectInput in) throws IOException {
+        try {
+            Type[] returnTypes;
+            if (invocation instanceof RpcInvocation) {
+                returnTypes = ((RpcInvocation) invocation).getReturnTypes(); // 读取方法调用返回值类型
+            } else {
+                returnTypes = RpcUtils.getReturnTypes(invocation);
+            }
+            Object value = null;
+            if (ArrayUtils.isEmpty(returnTypes)) {
+                // This almost never happens?
+                value = in.readObject();
+            } else if (returnTypes.length == 1) {
+                value = in.readObject((Class<?>) returnTypes[0]);
+            } else {
+                value = in.readObject((Class<?>) returnTypes[0], returnTypes[1]); // 如果返回值包含泛型 ，则调用反序列化解析接口
+            }
+            setValue(value);  
+        } catch (ClassNotFoundException e) {
+            rethrow(e);
+        }
+    }
+
+	private void handleException(ObjectInput in) throws IOException {
+        try {
+            setException(in.readThrowable()); // 保存读取的返回值异常结果
+        } catch (ClassNotFoundException e) {
+            rethrow(e);
+        }
+    }
+
+	private void handleAttachment(ObjectInput in) throws IOException {
+        try {
+            addObjectAttachments(in.readAttachments()); // 读取返回值为Null,并且有隐式参数
+        } catch (ClassNotFoundException e) {
+            rethrow(e);
+        }
+    }
+```
+
 
 
 # Hello World(注解开发)
