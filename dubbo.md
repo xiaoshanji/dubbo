@@ -2816,6 +2816,210 @@ public class AvailableClusterInvoker<T> extends AbstractClusterInvoker<T> {
 
 
 
+​		编解码器处理有三种场景：请求、响应和`Telent`调用。理解`Telnet`调用并不难，编解码器主要把`Telnet`当作明文字符串处理，按照`Dubbo`的调用规范，解
+
+析成调用命令格式，然后查找对应的`Invoker`，发起方法调用即可。
+
+​		为了支持未来更多的`Telnet`命令和扩展性，`Telnet`指令解析被设置成了扩展点`TelnetHandler`，每个`Telnet`指令都会实现这个扩展点：
+
+```java
+@SPI(scope = ExtensionScope.FRAMEWORK)
+public interface TelnetHandler {
+    // message包含处理命令之外的所有字符串参数，具体如何使用这些参数及这些参数的定义全部交给命令实现者决定
+    String telnet(Channel channel, String message) throws RemotingException;
+}
+```
+
+​		完成`Telnet`指令转发的核心实现类是`TelnetHandlerAdapter`，它的实现非常简单，首先将用户输入的指令识别成`command(`比如`invoke、Is`和`status)`，然
+
+后将剩余的内容解析成`message`，`message`会交给命令实现者去处理。实现代码类在`TelnetHandlerAdapter#telnet`中：
+
+```java
+	public String telnet(Channel channel, String message) throws RemotingException {
+        String prompt = channel.getUrl().getParameterAndDecoded(Constants.PROMPT_KEY, Constants.DEFAULT_PROMPT);
+        boolean noprompt = message.contains("--no-prompt");
+        message = message.replace("--no-prompt", "");
+        StringBuilder buf = new StringBuilder();
+        message = message.trim();
+        String command;
+        if (message.length() > 0) {
+            int i = message.indexOf(' ');
+            if (i > 0) {
+                command = message.substring(0, i).trim(); // 提取执行命令
+                message = message.substring(i + 1).trim(); // 提取命令后的所有字符串
+            } else {
+                command = message;
+                message = "";
+            }
+        } else {
+            command = "";
+        }
+        if (command.length() > 0) {
+            if (extensionLoader.hasExtension(command)) { // 检查系统是否有命对应的扩展点
+                if (commandEnabled(channel.getUrl(), command)) {
+                    try {
+                        String result = extensionLoader.getExtension(command).telnet(channel, message); // 交给具体扩展点执行
+                        if (result == null) {
+                            return null;
+                        }
+                        buf.append(result);
+                    } catch (Throwable t) {
+                        buf.append(t.getMessage());
+                    }
+                } else {
+                    buf.append("Command: ");
+                    buf.append(command);
+                    buf.append(" disabled");
+                }
+            } else {
+                buf.append("Unsupported command: ");
+                buf.append(command);
+            }
+        }
+        if (buf.length() > 0) {
+            buf.append("\r\n"); // 在Telnet消息结尾追加回车和换行
+        }
+        if (StringUtils.isNotEmpty(prompt) && !noprompt) {
+            buf.append(prompt);
+        }
+        return buf.toString();
+    }
+```
+
+
+
+​		常用命令`Invoke`：
+
+​				`Telnet`本地方法调用，在`InvokeTelnetHandler`中本地实现`Telnet`类调用：
+
+```java
+	public String telnet(Channel channel, String message) {
+
+        ...
+
+        int i = message.indexOf("(");
+
+        if (i < 0 || !message.endsWith(")")) {
+            return "Invalid parameters, format: service.method(args)";
+        }
+
+        String method = message.substring(0, i).trim(); // 提取调用方法(由接口名.方法名组成)
+        String args = message.substring(i + 1, message.length() - 1).trim(); // 提取调用方法参数值
+        i = method.lastIndexOf(".");
+        if (i >= 0) {
+            service = method.substring(0, i).trim(); // 提取方法前面的接口
+            method = method.substring(i + 1).trim(); // 提取方法名称
+        }
+
+        List<Object> list;
+        try {
+            list = JSON.parseArray("[" + args + "]", Object.class); // 将参数 JSON 串转换成 JSON 对象
+        } catch (Throwable t) {
+            return "Invalid json argument, cause: " + t.getMessage();
+        }
+        StringBuilder buf = new StringBuilder();
+        Method invokeMethod = null;
+        ProviderModel selectedProvider = null;
+        if (isInvokedSelectCommand(channel)) {
+            selectedProvider = (ProviderModel) channel.getAttribute(INVOKE_METHOD_PROVIDER_KEY);
+            invokeMethod = (Method) channel.getAttribute(SelectTelnetHandler.SELECT_METHOD_KEY);
+        } else {
+            for (ProviderModel provider : ApplicationModel.allProviderModels()) {
+                if (isServiceMatch(service, provider)) {
+                    selectedProvider = provider;
+                    List<Method> methodList = findSameSignatureMethod(provider.getAllMethods(), method, list);
+                    if (CollectionUtils.isNotEmpty(methodList)) {
+                        if (methodList.size() == 1) {
+                            invokeMethod = methodList.get(0);
+                        } else {
+                            List<Method> matchMethods = findMatchMethods(methodList, list); // 接口名、方法、参数值和类型作为检索方法的条件
+                            if (CollectionUtils.isNotEmpty(matchMethods)) {
+                                if (matchMethods.size() == 1) {
+                                    invokeMethod = matchMethods.get(0);
+                                } else { //exist overridden method
+                                    channel.setAttribute(INVOKE_METHOD_PROVIDER_KEY, provider);
+                                    channel.setAttribute(INVOKE_METHOD_LIST_KEY, matchMethods);
+                                    channel.setAttribute(INVOKE_MESSAGE_KEY, message);
+                                    printSelectMessage(buf, matchMethods);
+                                    return buf.toString();
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+
+        if (!StringUtils.isEmpty(service)) {
+            buf.append("Use default service ").append(service).append(".");
+        }
+        if (selectedProvider != null) {
+            if (invokeMethod != null) {
+                try {
+                    Object[] array = realize(list.toArray(), invokeMethod.getParameterTypes(),
+                            invokeMethod.getGenericParameterTypes()); // 将 JSON 参数值转换成 Java 对象值
+                    long start = System.currentTimeMillis();
+                    AppResponse result = new AppResponse();
+                    try {
+                        Object o = invokeMethod.invoke(selectedProvider.getServiceInstance(), array); // 根据查找到的Invoker、构造Rpclnvocation进行方法调用
+                        result.setValue(o);
+                    } catch (Throwable t) {
+                        result.setException(t);
+                    }
+                    long end = System.currentTimeMillis();
+                    buf.append("\r\nresult: ");
+                    buf.append(JSON.toJSONString(result.recreate()));
+                    buf.append("\r\nelapsed: ");
+                    buf.append(end - start);
+                    buf.append(" ms.");
+                } catch (Throwable t) {
+                    return "Failed to invoke method " + invokeMethod.getName() + ", cause: " + StringUtils.toString(t);
+                }
+            } else {
+                buf.append("\r\nNo such method ").append(method).append(" in service ").append(service);
+            }
+        } else {
+            buf.append("\r\nNo such service ").append(service);
+        }
+        return buf.toString();
+    }
+```
+
+​		当本地没有客户端，想测试服务端提供的方法时，可以使用`Telnet`登录到远程服务器`(Telnet IP port)`，根据`invoke`指令执行方法调用来获得结果。
+
+
+
+​		`Telnet`提供了健康检查的命令，可以在`Telnet`连接成功后执行`status -l`查看线程池、内存和注册中心等状态信息。为了完成线程池监控、内存和注册中心
+
+监控等诉求，`Telnet`提供了新的扩展点`Statuschecke`：
+
+```java
+@SPI(scope = ExtensionScope.APPLICATION)
+public interface StatusChecker {
+    Status check();
+}
+```
+
+​		当执行`status`命令时会触发`StatusTelnetHandler#telnet`调用，这个方法的实现也比较简单，它会加载所有实现`Statuschecker`扩展点的类，然后调用所有
+
+扩展点的`check`方法。
+
+![](image/QQ截图20211124102342.png)
+
+
+
+
+
+
+
+
+
+
+
+
+
 # Hello World(注解开发)
 
 ​		服务端：
