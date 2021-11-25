@@ -3010,6 +3010,225 @@ public interface StatusChecker {
 
 
 
+​		`Dubbo`中`Handler(ChannelHandler)`的`5`种状态：
+
+![](image/QQ截图20211125093138.png)
+
+![](image/QQ截图20211125093354.png)
+
+​		同时具有入站和出站`ChannelHandler`的布局，如果有一个入站事件被触发，比如连接或数据读取，那么它会从`ChannelPipeline`头部开始一直传播到
+
+`Channelpipeline`的尾端。出站的`I/O`事件将从`ChannelPipeline`最右边开始，然后向左传播。当然，在`ChannelPipeline`传播事件时，它会测试入站是否实现了
+
+`ChannellnboundHandler`接口，如果没有实现则会自动跳过，出站时会监测是否实现`ChannelOutboundHandler`，如果没有实现，那么也会自动跳过。在`Dubbo`框架
+
+中实现的这两个接口类主要是`NettyServerHandler`和`NettyClientHandler`。`Dubbo`通过装饰者模式层包装`Handler`，从而不需要将每个`Handler`都追加到
+
+`Pipeline`中。
+
+![](image/QQ截图20211125093826.png)
+
+​		`RPC`调用服务方处理`Handler`的逻辑，在`DubboProtocol`中通过内部类继承自`ExchangeHandlerAdapter`，完成服务提供方`Invoker`实例的查找并进行服务的
+
+真实调用：
+
+```java
+	private ExchangeHandler requestHandler = new ExchangeHandlerAdapter() {
+        public CompletableFuture<Object> reply(ExchangeChannel channel, Object message) throws RemotingException {
+            if (!(message instanceof Invocation)) {
+                throw new RemotingException(channel, "Unsupported request: " + (message == null ? null : message.getClass().getName() + ": " + message) + ", channel: consumer: " + channel.getRemoteAddress() + " --> provider: " + channel.getLocalAddress());
+            } else {
+                Invocation inv = (Invocation)message;
+                Invoker<?> invoker = DubboProtocol.this.getInvoker(channel, inv); // 找 invocation 关联的 Invoker
+                
+                ...
+
+                RpcContext.getServiceContext().setRemoteAddress(channel.getRemoteAddress());
+                Result result = invoker.invoke(inv); // 调用业务方具体方法
+                return result.thenApply(Function.identity());
+            }
+        }
+
+        ...
+    };
+```
+
+​		在服务端唯一标识的服务是由`4`部分组成的：端口、接口名、 接口版本和接口分组：
+
+```java
+	Invoker<?> getInvoker(Channel channel, Invocation inv) throws RemotingException {
+        boolean isCallBackServiceInvoke = false;
+        boolean isStubServiceInvoke = false;
+        int port = channel.getLocalAddress().getPort(); // 获取服务暴露协议的端口
+        String path = (String)inv.getObjectAttachments().get("path"); // 获取调用传递的接口
+        
+        ...
+
+        String serviceKey = serviceKey(port, path, (String)inv.getObjectAttachments().get("version"), (String)inv.getObjectAttachments().get("group")); // 根据端口、接口名、接口分组和接口版本构造唯一的
+        DubboExporter<?> exporter = (DubboExporter)this.exporterMap.get(serviceKey); // 从 HashMap 中获取 Exporter
+        if (exporter == null) {
+            throw new RemotingException(channel, "Not found exported service: " + serviceKey + " in " + this.exporterMap.keySet() + ", may be version or group mismatch , channel: consumer: " + channel.getRemoteAddress() + " --> provider: " + channel.getLocalAddress() + ", message:" + this.getInvocationWithoutData(inv));
+        } else {
+            return exporter.getInvoker();
+        }
+    }
+```
+
+
+
+​		`Dubbo`实现线程派发：
+
+![](image/QQ截图20211125095100.png)
+
+​		`Dispatcher`就是线程池派发器。这里需要注意的是，`Dispatcher`真实的职责是创建具有线程派发能力的`ChannelHandler`，其本身并不具备线程派发能力：
+
+![](image/QQ截图20211125095334.png)
+
+
+
+​		在`Dubbo`框架内部，所有方法调用会被抽象成`Request/Response`，每次调用`(`一次会话`)`都会创建一个请求`Request`，如果是方法调用则会返回一个
+
+`Response`对象。`HeaderExchangeHandler`用来处理这种场景：
+
+​				1、更新发送和读取请求时间戳。
+
+​				2、判断请求格式或编解码是否有错，并响应客户端失则的具体原因。
+
+​				3、处理`Request`请求和`Response`正常响应。
+
+​				4、支持`Telnet`调用。 
+
+```java
+	public void received(Channel channel, Object message) throws RemotingException {
+        final ExchangeChannel exchangeChannel = HeaderExchangeChannel.getOrAddChannel(channel);
+        if (message instanceof Request) {
+            // handle request.
+            Request request = (Request) message;
+            if (request.isEvent()) {
+                handlerEvent(channel, request); // 处理 readonly 事件，在 channel 中打标
+            } else {
+                if (request.isTwoWay()) {
+                    handleRequest(exchangeChannel, request); // 处理方法调用并返回给客户端
+                } else {
+                    handler.received(exchangeChannel, request.getData());
+                }
+            }
+        } else if (message instanceof Response) {
+            handleResponse(channel, (Response) message); // 接收响应
+        } else if (message instanceof String) {
+            if (isClientSide(channel)) { // 客户端不支持 Telnet 调用
+                Exception e = new Exception("Dubbo client can not supported string message: " + message + " in channel: " + channel + ", url: " + channel.getUrl());
+                logger.error(e.getMessage(), e);
+            } else {
+                String echo = handler.telnet(channel, (String) message);
+                if (echo != null && echo.length() > 0) { // 触发 Telnet 调用，并返回
+                    channel.send(echo);
+                }
+            }
+        } else {
+            handler.received(exchangeChannel, message);
+        }
+    }
+```
+
+​		处理请求和响应`(HeaderExchangeHandler#handleRequest,handleRespons)`：
+
+```java
+	void handleRequest(final ExchangeChannel channel, Request req) throws RemotingException {
+        Response res = new Response(req.getId(), req.getVersion());
+        if (req.isBroken()) {
+            Object data = req.getData();
+
+            String msg;
+            if (data == null) {
+                msg = null;
+            } else if (data instanceof Throwable) {
+                msg = StringUtils.toString((Throwable) data); // 处理请求格式不正确(编解码)，并把异常传换成字符串返回
+            } else {
+                msg = data.toString();
+            }
+            res.setErrorMessage("Fail to decode request due to: " + msg);
+            res.setStatus(Response.BAD_REQUEST);
+
+            channel.send(res);
+            return;
+        }
+        // find handler by message class.
+        Object msg = req.getData();
+        try {
+            CompletionStage<Object> future = handler.reply(channel, msg); // 调用 DubboProtocol#reply，触发方法调用
+            future.whenComplete((appResult, t) -> {
+                try {
+                    if (t == null) {
+                        res.setStatus(Response.OK);
+                        res.setResult(appResult);
+                    } else {
+                        res.setStatus(Response.SERVICE_ERROR); // 方法调用失败
+                        res.setErrorMessage(StringUtils.toString(t));
+                    }
+                    channel.send(res);
+                } catch (RemotingException e) {
+                    logger.warn("Send result to consumer failed, channel is " + channel + ", msg is " + e);
+                }
+            });
+        } catch (Throwable e) {
+            res.setStatus(Response.SERVICE_ERROR);
+            res.setErrorMessage(StringUtils.toString(e));
+            channel.send(res);
+        }
+    }
+
+	static void handleResponse(Channel channel, Response response) throws RemotingException {
+        if (response != null && !response.isHeartbeat()) {
+            DefaultFuture.received(channel, response); // 唤醒阻塞的线程，并通知结果
+        }
+    }
+```
+
+
+
+​		`Dubbo`默认客户端和服务端都会发送心跳报文，用来保持`TCP`长连接状态。在客户端和服务端，`Dubbo`内部开启一个线程循环扫描并检测连接是否超时，在
+
+服务端如果发现超时则会主动关闭客户端连接，在客户端发现超时则会主动重新创建连接。
+
+​		`Dubbo`在服务端和客户端都复用心跳实现代码，抽象成`HeartBeatTask`任务进行处理：
+
+```java
+	public void run(Timeout timeout) throws Exception {
+        Collection<Channel> c = channelProvider.getChannels(); 
+        for (Channel channel : c) { // 遍历所有 Channel
+            if (channel.isClosed()) { // 忽略关闭的 Channel
+                continue;
+            }
+            doTask(channel);
+        }
+        reput(timeout, tick);
+    }
+
+
+	protected void doTask(Channel channel) {
+        try {
+            Long lastRead = lastRead(channel);
+            Long lastWrite = lastWrite(channel);
+            if ((lastRead != null && now() - lastRead > heartbeat)
+                    || (lastWrite != null && now() - lastWrite > heartbeat)) { // TCP连接空闲超过心跳时间，发送事件报文
+                Request req = new Request();
+                req.setVersion(Version.getProtocolVersion());
+                req.setTwoWay(true);
+                req.setEvent(HEARTBEAT_EVENT);
+                channel.send(req);
+                if (logger.isDebugEnabled()) {
+                    logger.debug("Send heartbeat to remote channel " + channel.getRemoteAddress()
+                            + ", cause: The channel has no data-transmission exceeds a heartbeat period: "
+                            + heartbeat + "ms");
+                }
+            }
+        } catch (Throwable t) {
+            logger.warn("Exception when heartbeat to remote channel " + channel.getRemoteAddress(), t);
+        }
+    }
+```
+
 
 
 
