@@ -3233,6 +3233,269 @@ public interface StatusChecker {
 
 
 
+# 集群容错
+
+​		在微服务环境中，为了保证服务的高可用，很少会有单点服务出现，服务通常都是以集群的形式出现的。然而，被调用的远程服务并不是每时每刻都保持良好
+
+状况，当某个服务调用出现异常时，需要自动容错，或者只想本地测试、服务降级，需要`Mock`返回结果`。就需要使用集群容错机制。
+
+​		把`Cluster`看作一个集群容错层，该层中包含`Cluster、Directory、Router、LoadBalance`几大核心接口。`Cluster`层是抽象概念，表示的是对外的整个集群
+
+容错层；`Cluster`是容错接口，提供`Failover、Failfast`等容错策略。
+
+​		`Cluster`的总体工作流程：
+
+​				1、生成`Invoker`对象。不同的`Cluster`实现会生成不同类型的`Clusterinvoker`对象并返回。然后调用`Clusterinvoker`的`Invoker`方法，正式开始调用
+
+​		流程。
+
+​				2、获得可调用的服务列表。首先会做前置校验，检查远程服务是否已被销毁。然后通过`Directory#list`方法获取所有可用的服务列表。接着使用
+
+​		`Router`接口处理该服务列表，根据路由规则过滤一部分服务，最终返回剩余的服务列表。
+
+​				3、做负载均衡。在上面得到的服务列表还需要通过不同的负载均衡策略选出一个服务，用作最后的调用。首先框架会根据用户的配置，调用
+
+​		`ExtensionLoader`获取不同负载均衡策略的扩展点实现。然后做一些后置操作，如果是异步调用则设置调用编号。接着调用子类实现的`dolnvoke`方法， 子类
+
+​		会根据具体的负载均衡策略选出一个可以调用的服务。
+
+​				4、做`RPC`调用。首先保存每次调用的`Invoker`到`RPC`上下文，并做`RPC`调用。然后处理调用结果，对于调用出现异常、成功、失败等情况，每种容错策
+
+​		略会有不同的处理方式。
+
+![](image/QQ截图20211126092744.png)
+
+​		`Dubbo`容错机制能增强整个应用的鲁棒性，容错过程对上层用户是完全透明的，但用户也可以通过不同的配置项来选择不同的容错机制。每种容错机制又有
+
+自己个性化的配置项。
+
+![](image/QQ截图20211126093015.png)
+
+![](image/QQ截图20211126093029.png)
+
+
+
+​		在微服务环境中，可能多个节点同时都提供同一个服务。当上层调用`Invoker`时，无论实际存在多少个`Invoker`，只需要通过`Cluster`层，即可完成整个调用
+
+的容错逻辑，包括获取服务列表、路由、负载均衡等，整个过程对上层都是透明的。当然，`Cluster`接口只是串联起整个逻辑， 其中`Clusterlnvoker`只实现了容
+
+错策略部分，其他逻辑则是调用了`Directory、Router、LoadBalance`等接口实现。
+
+​		容错的接口主要分为两大类，第一类是`Cluster`类，第二类是`Clusterinvoker`类。`Cluster`和`Clusterinvoker`之间的关系也非常简单：`Cluster`接口下面有
+
+多种不同的实现，每种实现中都需要实现接口的`join`方法，在方法中会`new`一个对应的`Clusterinvoker`实现。
+
+```java
+public class FailoverCluster extends AbstractCluster {
+
+    public final static String NAME = "failover";
+
+    @Override
+    public <T> AbstractClusterInvoker<T> doJoin(Directory<T> directory) throws RpcException {
+        return new FailoverClusterInvoker<>(directory);
+    }
+
+}
+
+
+public abstract class AbstractCluster implements Cluster {
+    ...
+}
+```
+
+​		`Cluster`是最上层的接口。`Cluster`接口上有`@SPI`注解，也就是说， 实现类是通过扩展机制动态生成的。每个实现类里都只有一个`join`方法，实现也很简
+
+单，直接`new`一个对应的`Clusterinvoker`。其中`AvailableCluster`例外，直接使用匿名内部类实现了所有功能。
+
+![](image/QQ截图20211126095458.png)
+
+![](image/QQ截图20211126100105.png)
+
+## Failover策略
+
+​		默认实现是`Failover`：
+
+​				1、校验。校验从`AbstractClusterlnvoker`传入的`Invoker`列表是否为空。
+
+​				2、获取配置参数。从调用`URL`中获取对应的`retries`重试次数。
+
+​				3、初始化一些集合和对象。用于保存调用过程中出现的异常、记录调用了哪些节点`(`这个会在负载均衡中使用，在某些配置下，尽量不要一直调用同一
+
+​		个服务)。
+
+​				4、使用`for`循环实现重试，`for`循环的次数就是重试的次数。成功则返回，否则继续循环。 如果`for`循环完，还没有一个成功的返回，则抛出异常，
+
+​		把`3`中记录的信息抛出去。 
+
+​						校验：如果for循环次数大于1，即有过一次失败，则会再次校验节点是否被销毁、传入的`Invoker`列表是否为空。
+
+​						负载均衡：调用`select`方法做负载均衡，得到要调用的节点，并记录这个节点到步骤`3`的集合里，再把己经调用的节点信息放进`RPC`上下文中。 
+
+​						远程调用：调用`invoker#invoke`方法做远程调用，成功则返回，异常则记录异常信息， 再做下次循环。
+
+![](image/QQ截图20211126101022.png)
+
+## Failfast策略
+
+​		`Failfast`会在失败后直接抛出异常并返回：
+
+​				1、校验。校验从`AbstractClusterlnvoker`传入的`Invoker`列表是否为空。
+
+​				2、负载均衡。调用`select`方法做负载均衡，得到要调用的节点。
+
+​				3、进行远程调用。在`try`代码块中调用`invoker#invoke`方法做远程调用。如果捕获到异常，则直接封装成`RpcException`抛出。
+
+
+
+## Failsafe策略
+
+​		`Failsafe`调用时如果出现异常，则会直接忽略：
+
+​				1、校验传入的参数。校验从`AbstractClusterlnvoker`传入的`Invoker`列表是否为空。
+
+​				2、负载均衡。调用`select`方法做负载均衡，得到要调用的节点。
+
+​				3、远程调用。在`try`代码块中调用`invoker#invoke`方法做远程调用，`catch`到任何异常都直接吞掉，返回一个空的结果集。
+
+```java
+public class FailsafeClusterInvoker<T> extends AbstractClusterInvoker<T> {
+    
+    ...
+
+    @Override
+    public Result doInvoke(Invocation invocation, List<Invoker<T>> invokers, LoadBalance loadbalance) throws RpcException {
+        try {
+            checkInvokers(invokers, invocation); // 校验传入的参数
+            Invoker<T> invoker = select(loadbalance, invocation, invokers, null); // 做负载均衡
+            return invokeWithContext(invoker, invocation); // 进行远程调用，调用成功则直接返回
+        } catch (Throwable e) {
+            logger.error("Failsafe ignore exception: " + e.getMessage(), e);
+            return AsyncRpcResult.newDefaultAsyncResult(null, null, invocation); // 捕获到异常，直接返回一个空的结果集
+        }
+    }
+}
+```
+
+
+
+## Fallback策略
+
+​		`Fallback`如果调用失败，则会定期重试。`FailbackClusterlnvoker`里面定义了一个`List`，专门用来保存失败的调用。另外定义了一个定时线程池，默认每
+
+`5`秒把所有失败的调用拿出来，重试一次。如果调用重试成功，则会从`List`中移除。
+
+​				1、校验传入的参数。校验从`AbstractClusterlnvoker`传入的`Invoker`列表是否为空。
+
+​				2、负载均衡。调用`select`方法做负载均衡，得到要调用的节点。
+
+​				3、远程调用。在`try`代码块中调用`invoker#invoke`方法做远程调用，`catch`到异常后直接把`invocation`保存到重试的`List`中，并返回一个空的结果
+
+​		集。
+
+​				4、定时线程池会定时把`List`中的失败请求拿出来重新请求，请求成功则从`List`中移除。如果请求还是失败，则异常也会被`catch`住，不会影响`List`
+
+​		中后面的重试。
+
+```java
+	protected Result doInvoke(Invocation invocation, List<Invoker<T>> invokers, LoadBalance loadbalance) throws RpcException {
+        Invoker<T> invoker = null;
+        URL consumerUrl = RpcContext.getServiceContext().getConsumerUrl();
+        try {
+            checkInvokers(invokers, invocation);
+            invoker = select(loadbalance, invocation, invokers, null);
+            // Asynchronous call method must be used here, because failback will retry in the background.
+            // Then the serviceContext will be cleared after the call is completed.
+            return invokeWithContextAsync(invoker, invocation, consumerUrl);
+        } catch (Throwable e) {
+            logger.error("Failback to invoke method " + invocation.getMethodName() + ", wait for retry in background. Ignored exception: "
+                + e.getMessage() + ", ", e);
+            if (retries > 0) {
+                addFailed(loadbalance, invocation, invokers, invoker, consumerUrl); // 失败，加入 List 中
+            }
+            return AsyncRpcResult.newDefaultAsyncResult(null, null, invocation); // ignore
+        }
+    }
+
+	private void addFailed(LoadBalance loadbalance, Invocation invocation, List<Invoker<T>> invokers, Invoker<T> lastInvoker, URL consumerUrl) {
+        if (failTimer == null) {
+            synchronized (this) {
+                if (failTimer == null) {
+                    failTimer = new HashedWheelTimer(
+                        new NamedThreadFactory("failback-cluster-timer", true),
+                        1,
+                        TimeUnit.SECONDS, 32, failbackTasks);
+                }
+            }
+        }
+        RetryTimerTask retryTimerTask = new RetryTimerTask(loadbalance, invocation, invokers, lastInvoker, retries, RETRY_FAILED_PERIOD, consumerUrl);
+        try {
+            failTimer.newTimeout(retryTimerTask, RETRY_FAILED_PERIOD, TimeUnit.SECONDS);
+        } catch (Throwable e) {
+            logger.error("Failback background works error, invocation->" + invocation + ", exception: " + e.getMessage());
+        }
+    }
+```
+
+
+
+## Available策略
+
+​		`Available`是找到第一个可用的服务直接调用，并返回结果：
+
+​				1、遍历从`AbstractClusterlnvoker`传入的`Invoker`列表，如果`Invoker`是可用的，则直接调用并返回。
+
+​				2、如果遍历整个列表还没找到可用的`Invoker`，则抛出异常。
+
+
+
+## Broadcast策略
+
+​		`Broadcast`会广播给所有可用的节点，如果任何一个节点报错，则返回异常：
+
+​				1、前置操作。校验从`AbstractClusterlnvoker`传入的`Invoker`列表是否为空；在`RPC`上下文中设置`Invoker`列表；初始化一些对象，用于保存调用过
+
+​		程中产生的异常和结果信息等。
+
+​				2、循环遍历所有`Invoker`，直接做`RPC`调用。任何一个节点调用出错，并不会中断整个 广播过程，会先记录异常，在最后广播完成后再抛出。如果多
+
+​		个节点异常，则只有最后一个节点的异常会被抛出，前面的异常会被覆盖。
+
+
+
+## Forking策略
+
+​		`Forking`可以同时并行请求多个服务，有任何一个返回，则直接返回。相对于其他调用策略，`Forking`的实现是最复杂的：
+
+​				1、准备工作。校验传入的`Invoker`列表是否可用；初始化一个`Invoker`集合，用于保存真正要调用的`Invoker`列表；从`URL`中得到最大并行数、超时时
+
+​		间。
+
+​				2、获取最终要调用的`Invoker`列表。假设用户设置最大的并行数为`n`，实际可以调用的最大服务数为`v`。如果`n<0`或`n>v`，则说明可用的服务数小于
+
+​		用户的设置，因此最终要调用的`Invoker`只能有`v`个；如果`n<v`则会循环调用负载均衡方法，不断得到可调用的`Invoker`，加入`Invoker`集合里。 在
+
+​		`Invoker`加入集合时，会做去重操作。因此，如果用户设置的负载均衡策略每次返回的都是同一个`Invoker`，那么集合中最后只会存在一个`Invoker``，也就
+
+​		是只会调用一个节点。
+
+​				3、调用前的准备工作。设置要调用的`Invoker`列表到`RPC`上下文；初始化一个异常计数器；初始化一个阻塞队列，用于记录并行调用的结果。
+
+​				4、执行调用。循环使用线程池并行调用，调用成功，则把结果加入阻塞队列；调用失败， 则失败计数`+1`。如果所有线程的调用都失败了，即失败计
+
+​		数`>=`所有可调用的`Invoker`时，则把异常信息加入阻塞队列。 
+
+​				5、同步等待结果。由于步骤`4`中的步骤是在线程池中执行的，因此主线程还会继续往下执行，主线程中会使用阻塞队列的`poll(`超时时间`)`方法，同步
+
+​		等待阻塞队列中的第一个结果， 如果是正常结果则返回，如果是异常则抛出。
+
+​		`Forking`的超时是通过在阻塞队列的`poll`方法中传入超时时间实现的； 线程池中的并发调用会获取第一个正常返回结果。只有所有请求都失败了，
+
+`Forking`才会失败。
+
+![](image/QQ截图20211126103429.png)
+
+
+
 
 
 
