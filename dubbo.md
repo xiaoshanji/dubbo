@@ -3498,6 +3498,119 @@ public class FailsafeClusterInvoker<T> extends AbstractClusterInvoker<T> {
 
 
 
+​		整个容错过程中首先会使用`Directory#list`来获取所有的`Invoker`列表。`Directory`也有多种实现子类，既可以提供静态的`Invoker`列表，也可以提供动态
+
+的`Invoker`列表。静态列表是用户自己设置的`Invoker`列表；动态列表根据注册中心的数据动态变化，动态更新`Invoker`列表的数据，整个过程对上层透明。
+
+![](image/QQ截图20211129090800.png)
+
+​		`AbstractDirectory`封装了通用逻辑，主要实现了四个方法：检测`Invoker`是否可用， 销毁所有`Invoker,list`方法，还留了一个抽象的`doList`方法给子类自
+
+行实现。`list`方法是最主要的方法，用于返回所有可用的`list`，逻辑分为两步：
+
+​				调用抽象方法`doList`获取所有`Invoker`列表，不同子类有不同的实现。
+
+​				遍历所有的`router`，进行`Invoker`的过滤，最后返回过滤好的`Invoker`列表。
+
+​		`doList`抽象方法则是返回所有的`Invoker`列表，由于是抽象方法，子类继承后必须要有自己的实现。
+
+​		`RegistryDirectory`属于`Directory`的动态列表实现，会自动从注册中心更新`Invoker`列表、配置信息、路由列表。
+
+​		`StaticDirectory`：`Directory`的静态列表实现，即将传入的`Invoker`列表封装成静态的`Directory`对象，里面的列表不会改变。因为
+
+`Cluste#join(Directopy〈T> directory)`方法需要传入`Directory`对象，因此该实现主要使用在一些上层已经知道自己要调用哪些`Invoker`，只需要包装一个
+
+`Directory`对象返回即可的场景。在`ReferenceConfig#createProxy`和`RegistryDirectory#toMergeMethodInvokerMap`中使用了`Cluster#join`方法。
+
+`StaticDirectory `的逻辑非常简单，在构造方法中需要传入`Invoker`列表，`doList`方法则直接返回初始化时传入的列表。
+
+
+
+​		`RegistryDirectory`中有两条比较重要的逻辑线：
+
+​				第一条，框架与注册中心的订阅，并动态更新本地`Invoker`列表、路由列表、配置信息的逻辑。
+
+​				第二条，子类实现父类的`doList`方法。
+
+​		订阅和动态更新逻辑。这个逻辑主要涉及`subscribe、notify、refreshinvoker`三个方法。
+
+​		`subscribe`是订阅某个`URL`的更新信息。`Dubbo`在引用每个需要`RPC`调用的`Bean`的时候，会调用`directory.subscribe`来订阅这个`Bean`的各种`URL`的变化
+
+`(Bean`的配置在配置中心中都是以`URL`的形式存放的`)`。
+
+​		`notify`就是监听到配置中心对应的`URL`的变化，然后更新本地的配置参数。监听的`URL`分为三类：配置`configurators`、路由规则`router`、`Invoker`列表：
+
+​				1、新建三个`List`，分别用于保存更新的`Invoker URL`、路由配置`URL`、配置`URL`。遍历监听返回的所有`URL`，分类后放入三个`List`中。
+
+​				2、解析并更新配置参数：
+
+​						1、对于`router`类参数，首先遍历所有`router`类型的`URL`，然后通过`Router`工厂把每个`URL`包装成路由规则，最后更新本地的路由信息。这个过
+
+​				程会忽略以`empty`开头的`URL`。
+
+​						2、对于`Configurator`类的参数，管理员可以在`dubbo-admin`动态配置功能上修改生产者的参数，这些参数会保存在配置中心的`configurators`类
+
+​				目下。`notify`监听到`URL`配置参 数的变化，会解析并更新本地的`Configurator`配置。
+
+​						3、对于`Invoker`类型的参数，如果是`empty`协议的`URL`，则会禁用该服务，并销毁本地缓存的`Invoker`；如果监听到的`Invoker`类型`URL`都是空
+
+​				的，则说明没有更新，直接使用本地的老缓存；如果监听到的`Invoker`类型`URL`不为空，则把新的`URL`和本地老的`URL`合并，创建新的`Invoker`，找出
+
+​				差异的老`Invoker`并销毁。
+
+![](image/QQ截图20211129092450.png)
+
+​		`dubbo-admin`上更新路由规则或参数是通过`override://`协议实现的。`override`协议的`URL`会覆盖更新本地`URL`中对应的参数。如果是`empty://`协议的
+
+`URL`，则会清空本地的配置，这里会调用`Configurator`接口来实现该功能。
+
+
+
+​		`notify`中更新的`Invoker`列表最终会转化为一个字典`Map<URL, Invoker<T>> `的`urlInvokerMap`，`doList`的最终目标就是在字典里匹配出可以调用的
+
+`Invoker`列表，并返回给上层：
+
+​				1、检查服务是否被禁用。如果配置中心禁用了某个服务，则该服务无法被调用。如果服务被禁用则会抛出异常。
+
+​				2、根据方法名和首参数构建`URL`去匹配`Invoker`。如果在这一步没有匹配到`Invoker`列表，则进入第`3`步。
+
+​				3、根据方法名匹配`Invoker`，以方法名构建`URL`去`urlInvokerMap`中匹配`Invoker`列表，如果还是没有匹配到，则进入第4步。
+
+​				4、根据`*`匹配`Invoker`，用星号去匹配`Invoker`列表，如果还没有匹配到，则进入最后一步兜底操作。
+
+​				5、遍历`urlInvokerMap`，找到第一个`Invoker`列表返回。如果还没有，则返回一个空列表。
+
+
+
+# 路由
+
+​		路由接口会根据用户配置的不同路由策略对`Invoker`列表进行过滤，只返回符合规则的`Invoker`。
+
+​		路由分为条件路由、文件路由、脚本路由，对应`dubbo-admin`中三种不同的规则配置方式。 条件路由是用户使用`Dubbo`定义的语法规则去写路由规则；文件
+
+路由则需要用户提交一个文件, 里面写着对应的路由规则，框架基于文件读取对应的规则；脚本路由则是使用`JDK`自身的脚本引擎解析路由规则脚本，所有`JDK`脚
+
+本引擎支持的脚本都能解析，默认是`JavaScrip`。
+
+![](image/QQ截图20211129100833.png)
+
+​		`RouterFactory`是一个`SPI`接口，没有设置默认值，但由于有`@Adaptive("protocol")`注解， 因此它会根据`URL`中的`protocol`参数确定要初始化哪一个具体
+
+的`Router`实现：
+
+```java
+@SPI
+public interface RouterFactory {
+    
+    @Adaptive("protocol")
+    Router getRouter(URL url);
+}
+```
+
+​		`RouterFactory`的实现类也非常简单，就是直接`new`一个对应的`Router`并返回。`FileRouterFactory`除外，直接在工厂类中实现了所有逻辑。
+
+
+
 
 
 
