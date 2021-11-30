@@ -3611,6 +3611,324 @@ public interface RouterFactory {
 
 
 
+# 负载均衡
+
+​		在整个集群容错流程中，首先经过`Directory`获取所有`Invoker`列表，然后经过`Router`根据路由规则过滤`Invoker`，最后幸存下来的`Invoker`还需要经过负
+
+载均衡这一关，选出最终要调用的`Invoker`。
+
+​		很多容错策略中都会使用负载均衡方法，并且所有的容错策略中的负载均衡都使用了抽象父类`Abstractclusterinvoker`中定义的`Invoker<T> select` 方法，
+
+而并不是直接使用`LoadBalance`方法。因为抽象父类在`LoadBalance`的基础上又封装了一些新的特性：
+
+​				1、粘滞连接。`Dubbo`中有一种特性叫粘滞连接：用于有状态服务，尽可能让客户端总是向同一提供者发起调用，除非该提供者挂了，再连接另一台。
+
+​				2、可用检测。`Dubbo`调用的`URL`中，如果含有`cluster.availablecheck=false`，则不会检测远程服务是否可用，直接调用。如果不设置，则默认会开启
+
+​		检查，对所有的服务都做是否可用的检查，如果不可用，则再次做负载均衡。
+
+​				3、避免重复调用。对于已经调用过的远程服务，避免重复选择，每次都使用同一个节点。 这种特性主要是为了避免并发场景下，某个节点瞬间被大量
+
+​		请求。
+
+​		整个逻辑过程大致可以分为`4`步：
+
+​				1、检查`URL`中是否有配置粘滞连接，如果有则使用粘滞连接的`Invoker`。如果没有配置粘滞连接，或者重复调用检测不通过、可用检测不通过，则进入
+
+​		第`2步`。
+
+​				2、通过`ExtensionLoader`获取负载均衡的具体实现，并通过负载均衡做节点的选择。对选择出来的节点做重复调用、可用性检测，通过则直接返回，否
+
+​		则进入第`3`步。
+
+​				3、进行节点的重新选择。如果需要做可用性检测，则会遍历`Directory`中得到的所有节点，过滤不可用和已经调用过的节点，在剩余的节点中重新做负
+
+​		载均衡；如果不需要做可用性检测，那么也会遍历`Directory`中得到的所有节点，但只过滤已经调用过的，在剩余的节点中重新做负载均衡。这里存在一种情
+
+​		况，就是在过滤不可用或已经调用过的节点时，节点全部被过滤，没有剩下任何节点，此时进入第`4`步。
+
+​				4、遍历所有已经调用过的节点，选出所有可用的节点，再通过负载均衡选出一个节点并返回。如果还找不到可调用的节点，则返回`null`。 
+
+```java
+@SPI(RandomLoadBalance.NAME) // 默认的负载均衡实现就是RandomLoadBalan，随机负载均衡
+public interface LoadBalance {
+    
+    @Adaptive("loadbalance") // 们在URL中可以通过 loadbalance=xxx 来动态指定 select 时的负载均衡算法
+    <T> Invoker<T> select(List<Invoker<T>> invokers, URL url, Invocation invocation) throws RpcException;
+}
+```
+
+![](image/QQ截图20211130092821.png)
+
+![](image/QQ截图20211130093443.png)
+
+​		抽象父类`AbstractLoadBalance`有两个权重相关的方法：`calculateWarmupWeight`和`getWeight`。`getWeight`方法就是获取当前`Invoker`的权重，
+
+`calculateWarmupWeight`是计算具体的权重。`getWeight`方法中会调用`calculateWarmupWeigh`：
+
+```java
+	protected int getWeight(Invoker<?> invoker, Invocation invocation) {
+        int weight;
+        URL url = invoker.getUrl();
+        // Multiple registry scenario, load balance among multiple registries.
+        if (REGISTRY_SERVICE_REFERENCE_PATH.equals(url.getServiceInterface())) {
+            weight = url.getParameter(REGISTRY_KEY + "." + WEIGHT_KEY, DEFAULT_WEIGHT); // 通过 URL 获取当前 Invoker 设置的权重
+        } else {
+            weight = url.getMethodParameter(invocation.getMethodName(), WEIGHT_KEY, DEFAULT_WEIGHT);
+            if (weight > 0) {
+                long timestamp = invoker.getUrl().getParameter(TIMESTAMP_KEY, 0L); // 获取启动的时间点
+                if (timestamp > 0L) {
+                    long uptime = System.currentTimeMillis() - timestamp; // 求差值，得到已经预热了多久
+                    if (uptime < 0) {
+                        return 1;
+                    }
+                    int warmup = invoker.getUrl().getParameter(WARMUP_KEY, DEFAULT_WARMUP); // 获取设置的总预热时间
+                    if (uptime > 0 && uptime < warmup) {
+                        weight = calculateWarmupWeight((int)uptime, warmup, weight); // 计算出最后的权重
+                    }
+                }
+            }
+        }
+        return Math.max(weight, 0);
+    }
+```
+
+​		框架考虑了服务刚启动的时候需要有一个预热的过程，如果一启动就给予`100%`的流量，则可能会让服务崩溃，因此实现了`calculateWarmupWeight`方法用于
+
+计算预热时候的权重，计算逻辑是：`(`启动至今时间`/`给予的预热总时间`)X`权重。
+
+
+
+## Random负载均衡
+
+​		`Random`负载均衡是按照权重设置随机概率做负载均衡的。这种负载均衡算法并不能精确地平均请求，但是随着请求数量的增加，最终结果是大致平均的：
+
+​				1、计算总权重并判断每个`Invoker`的权重是否一样。遍历整个`Invoker`列表，求和总权重。在遍历过程中，会对比每个`Invoker`的权重，判断所有
+
+​		`Invoker`的权重是否相同。
+
+​				2、如果权重相同，则说明每个`Invoker`的概率都一样，因此直接用`nextlnt`随机选一个`Invoker`返回即可。
+
+​				3、如果权重不同，则首先得到偏移值，然后根据偏移值找到对应的`Invoke`。
+
+```java
+	protected <T> Invoker<T> doSelect(List<Invoker<T>> invokers, URL url, Invocation invocation) {
+        // Number of invokers
+        int length = invokers.size();
+
+        if (!needWeightLoadBalance(invokers,invocation)){
+            return invokers.get(ThreadLocalRandom.current().nextInt(length));
+        }
+
+        // Every invoker has the same weight?
+        boolean sameWeight = true;
+        // the maxWeight of every invokers, the minWeight = 0 or the maxWeight of the last invoker
+        int[] weights = new int[length];
+        // The sum of weights
+        int totalWeight = 0;
+        for (int i = 0; i < length; i++) {
+            int weight = getWeight(invokers.get(i), invocation);
+            // Sum
+            totalWeight += weight;
+            // save for later use
+            weights[i] = totalWeight;
+            if (sameWeight && totalWeight != weight * (i + 1)) {
+                sameWeight = false;
+            }
+        }
+        if (totalWeight > 0 && !sameWeight) {
+            // If (not every invoker has the same weight & at least one invoker's weight>0), select randomly based on totalWeight.
+            int offset = ThreadLocalRandom.current().nextInt(totalWeight); // 根据总权重计算出一个随机的偏移量，此处使用了 ThreadLocalRandom 性能会更好
+            for (int i = 0; i < length; i++) { // 遍历所有的Invoker,得到被选中的Invoker
+                if (offset < weights[i]) {
+                    return invokers.get(i);
+                }
+            }
+        }
+        // If all invokers have the same weight value or totalWeight=0, return evenly.
+        return invokers.get(ThreadLocalRandom.current().nextInt(length));
+    }
+```
+
+
+
+## RoundRobin负载均衡
+
+​		权重轮询负载均衡会根据设置的权重来判断轮询的比例。普通轮询负载均衡的好处是每个节点获得的请求会很均匀，如果某些节点的负载能力明显较弱，则这
+
+个节点会堆积比较多的请求。因此普通的轮询还不能满足需求，还需要能根据节点权重进行干预。权重轮询又分为普通权重轮询和平滑权重轮询。普通权重轮询会
+
+造成某个节点会突然被频繁选中，这样很容易突然让一个节点流量暴增。`Nginx`中有一种叫平滑轮询的算法，这种算法在轮询时会穿插选择其他节点，让整个服务
+
+器选择的过程比较均匀，不会逮住一个节点一直调用。`Dubbo`框架中最新的`RoundRobin`代码已经改为平滑权重轮询算法：
+
+​				1、初始化权重缓存`Map`。以每个`Invoker`的`URL`为`key`，对象`WeightedRoundRobin`为`value`生成一个`ConcurrentMap`，并把这个`Map`保存到全局的
+
+​		`methodWeightMap`中：`ConcurrentMap<String, ConcurrentMap<String, WeightedRoundRobin>> methodWeightMap`。`methodWeightMap`的`key`是每个接口`+`方法
+
+​		名。这一步只会生成这个缓存`Map`，但里面是空的，第`2`步才会生成每个`Invoker`对应的键值。
+
+```java
+protected static class WeightedRoundRobin {
+        private int weight; // Invoker 设定的权重
+        private AtomicLong current = new AtomicLong(0); // 考虑到并发场景下某个 Invoker 会被同时选中，表示该节点被所有线程选中的权重总和
+        private long lastUpdate; // 最后一次更新的时间，用于后续缓存超时的判断
+
+        ...
+}
+```
+
+
+
+​				2、遍历所有`Invoker`。首先，在遍历的过程中把每个`Invoker`的数据填充到第`1`步生成的权重缓存`Map`中。其次，获取每个`Invoker`的预热权重，新版
+
+​		的框架`RoundRobin`也支持预热， 通过和`Random`负载均衡中相同的方式获得预热阶段的权重。如果预热权重和`Invoker`设置的权重不相等，则说明还在预热
+
+​		阶段，此时会以预热权重为准。然后，进行平滑轮询。每个`Invoker`会把权重加到自己的`current`属性上，并更新当前`Invoker`的`lastUpdate`。同时累加每
+
+​		个`Invoker`的权重到`totalweight`。最终，遍历完后，选出所有`Invoker`中`current`最大的作为最终要调用的节点。
+
+​				3、清除已经没有使用的缓存节点。由于所有的`Invoker`的权重都会被封装成一个`weightedRoundRobin`对象，因此如果可调用的`Invoker`列表数量和缓
+
+​		存`weightedRoundRobin`对象的`Map`大小不相等，则说明缓存`Map`中有无用数据。清除老旧数据时，各线程会先用`CAS`抢占锁`(`抢到锁的线程才做清除操作，
+
+​		抢不到的线程就直接跳过，保证只有一个线程在做清除操作`)`，然后复制原有的`Map`到一个新的`Map`中，根据`lastupdate`清除新`Map`中的过期数据`(`默认
+
+​		`60`秒算过期），最后把`Map`从旧的`Map`引用修改到新的`Map`上面。
+
+​				4、返回`Invoker`。注意，返回之前会把当前`Invoker`的`current`减去总权重。这是平滑权重轮询中重要的一步。
+
+![](image/QQ截图20211130100803.png)
+
+
+
+## LeastActive负载均衡
+
+​		`LeastActive`负载均衡称为最少活跃调用数负载均衡，即框架会记下每个`Invoker`的活跃数， 每次只从活跃数最少的`Invoker`里选一个节点。这个负载均衡
+
+算法需要配合`ActiveLimitFilter`过滤器来计算每个接口方法的活跃数。最少活跃负载均衡可以看作`Random`负载均衡的加强版，因为最后根据权重做负载均衡的
+
+时候，使用的算法和`Random`的一样：
+
+```java
+	protected <T> Invoker<T> doSelect(List<Invoker<T>> invokers, URL url, Invocation invocation) {
+        
+        ... // 初始化各种计数器
+
+        // Filter out all the least active invokers
+        for (int i = 0; i < length; i++) { 
+            Invoker<T> invoker = invokers.get(i);
+            int active = RpcStatus.getStatus(invoker.getUrl(), invocation.getMethodName()).getActive(); // 获得Invoker的活跃数
+            int afterWarmup = getWeight(invoker, invocation); // 获得Invoker的预热权重
+            // save for later use
+            weights[i] = afterWarmup;
+            // If it is the first invoker or the active number of the invoker is less than the current least active number
+            if (leastActive == -1 || active < leastActive) { // 第一次，或者发现有更小的活跃数
+                
+                ... // 置空计数器
+                
+            } else if (active == leastActive) { // 当前Invoker的活跃数与计数相同说明有N个Invoker都是最小计数，全部保存到集合中I后续就在它们里面根据权重选一个节点
+                ...
+            }
+        }
+        if (leastCount == 1) { // 如果只有一个Invoker则直接返回
+            return invokers.get(leastIndexes[0]);
+        }
+        if (!sameWeight && totalWeight > 0) { // 如果权重不一样，则使用和Random负载均衡一样的权重算法找到一个Invoker并返回
+            int offsetWeight = ThreadLocalRandom.current().nextInt(totalWeight);
+            for (int i = 0; i < leastCount; i++) {
+                int leastIndex = leastIndexes[i];
+                offsetWeight -= weights[leastIndex];
+                if (offsetWeight < 0) {
+                    return invokers.get(leastIndex);
+                }
+            }
+        }
+        
+        return invokers.get(leastIndexes[ThreadLocalRandom.current().nextInt(leastCount)]); // 如果权重相同，则直接随机选一个返回
+    }
+```
+
+​		在`ActiveLimitFilter`中，只要进来一个请求，该方法的调用的计数就会原子性`+1`。整个`Invoker`调用过程会包在`try-catch-finally`中，无论调用结束或
+
+出现异常，`finally`中都会把计数原子`-1`。该原子计数就是最少活跃数。
+
+
+
+## 一致性Hash负载均衡
+
+​		一致性`Hash`负载均衡可以让参数相同的请求每次都路由到相同的机器上。这种负载均衡的方式可以让请求相对平均，相比直接使用`Hash`而言，当某些节点
+
+下线时，请求会平摊到其他服务提供者，不会引起剧烈变动。
+
+​		普通一致性`Hash`会把每个服务节点散列到环形上，然后把请求的客户端散列到环上，顺时针往前找到的第一个节点就是要调用的节点。
+
+![](image/QQ截图20211130102632.png)
+
+​		`Dubbo`框架使用了优化过的`Ketama`一致性`Hash`。这种算法会为每个真实节点再创建多个虚拟节点，让节点在环形上的分布更加均匀，后续的调用也会随之
+
+更加均匀。
+
+```java
+	protected <T> Invoker<T> doSelect(List<Invoker<T>> invokers, URL url, Invocation invocation) {
+        String methodName = RpcUtils.getMethodName(invocation); // 获得方法名
+        String key = invokers.get(0).getUrl().getServiceKey() + "." + methodName; // 以接口名+方法名拼接出key
+
+        int invokersHashCode = getCorrespondingHashCode(invokers); // 把所有可以调用的Invoker列表进行 Hash
+        ConsistentHashSelector<T> selector = (ConsistentHashSelector<T>) selectors.get(key); // 现在Invoker列表的Hash码和之前的不一样，说明Invoker列表已经发生了变化，则重新创建Selector
+        if (selector == null || selector.identityHashCode != invokersHashCode) {
+            selectors.put(key, new ConsistentHashSelector<T>(invokers, methodName, invokersHashCode));
+            selector = (ConsistentHashSelector<T>) selectors.get(key);
+        }
+        return selector.select(invocation); // 通过 selector 选出一个 Invoker
+    }
+```
+
+​		整个逻辑的核心在`ConsistentHashSelector`中。`ConsistentHashSelector`初始化的时候会对节点进行散列，散列的环形是使用一个`TreeMap`实现的，所有的
+
+真实、虚拟节点都会放入`TreeMap`。把节点的`IP+`递增数字做`MD5`， 以此作为节点标识，再对标识做`Hash`得到`TreeMap`的`key`，最后把可以调用的节点作为
+
+`TreeMap`的`value`。
+
+```java
+		ConsistentHashSelector(List<Invoker<T>> invokers, String methodName, int identityHashCode) {
+            ...
+                
+            for (Invoker<T> invoker : invokers) { // 遍历所有的节点
+                String address = invoker.getUrl().getAddress(); // 得到每个节点的 ip
+                for (int i = 0; i < replicaNumber / 4; i++) { // repiicaNumber 是生成的虚拟节点数，默认为 160 个
+                    byte[] digest = Bytes.getMD5(address + i); // 以IP+递增数字做MD5,以此作为节点标识
+                    for (int h = 0; h < 4; h++) {
+                        long m = hash(digest, h); // 对标识做“Hash” 得到 TreeMap 的 key,以 Invoker 为 value
+                        virtualInvokers.put(m, invoker);
+                    }
+                }
+            }
+
+            ...
+        }
+```
+
+​		在客户端调用时候，只要对请求的参数也做`MD5`即可。虽然此时得到的`MD5`值不一定能对应到`TreeMap`中的一个`key`，因为每次的请求参数不同。但是由于
+
+`TreeMap`是有序的树形结构，所以可以调用`TreeMap`的`ceilingEntry`方法，用于返回一个至少大于或等于当前给定`key`的`Entry`，从而达到顺时针往前找的效
+
+果。如果找不到，则使用`firstEntry`返回第一个节点。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
