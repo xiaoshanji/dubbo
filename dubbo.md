@@ -3917,6 +3917,159 @@ protected static class WeightedRoundRobin {
 
 
 
+​		当一个接口有多种实现，消费者又需要同时引用不同的实现时，可以用`group`来区分不同的实现：
+
+```xml
+<dubbo:service group="group1" interface="xxx">
+<dubbo:service group="group2" interface="xxx">
+```
+
+​		如果需要并行调用不同`group`的服务，并且要把结果集合并起来，则需要用到`Merger`特性。`Merger`实现了多个服务调用后结果合并的逻辑。虽然业务层可
+
+以自行实现这个能力，但`Dubbo`直接封装到框架中，作为一种扩展点能力，简化了业务开发的复杂度。
+
+![](image/QQ截图20211201091231.png)
+
+​		`MergerCluster`是`Cluster`接口的一种实现，因此也遵循`Cluster`的设计模式，在`invoke`方法中完成具体逻辑。整个过程会使用`Merger`接口的具体实现来合
+
+并结果集。在使用的时候，通过`MergerFactory`获得各种具体的`Merger`实现。
+
+![](image/QQ截图20211201091828.png)
+
+​		如果开启了`Merger`特性，并且未指定合并器`(Merger`的具体实现`)`，则框架会根据接口的返回类型自动匹配合并器。可以扩展属于自己的合并器，
+
+`MergerFactory`在加载具体实现的时候，会用`ExtensionLoader`把所有`SPI`的实现都加载到缓存中。后续使用时直接从缓存中读取，如果读不到则会重新全量加载
+
+一次`SPI`。
+
+
+
+​		`MergeableCluster#join`方法中直接生成并返回了`MergeableClusterlnvoker`，`MergeableClusterInvoker#invoke`方法又通过`MergerFactory`工厂获取不同的
+
+`Merger`接口实现，完成了合并的具体逻辑。
+
+​		`MergeableCluster`并没有继承抽象的`Cluster`实现，而是独立完成了自己的逻辑：
+
+​				1、前置准备。通过`directory`获取所有`Invoker`列表。
+
+​				2、合并器检查。判断某个方法是否有合并器，如果没有，则不会并行调用多个`group`，找到第一个可以调用的`Invoker`直接调用就返回了。如果有合并
+
+​		器，则进入第`3`步。
+
+​				3、获取接口的返回类型。通过反射获得返回类型，后续要根据这个返回值查找不同的合并器。
+
+​				4、并行调用。把`Invoker`的调用封装成一个个`Callable`对象，放到线程池中执行，保存线程池返回的`future`对象到`HashMap`中，用于等待后续结果返
+
+​		回。
+
+​				5、等待`fixture`对象的返回结果。获取配置的超时参数，遍历`4`中得到的`fixture`对象， 设置`Future#get`的超时时间，同步等待得到并行调用的结
+
+​		果。异常的结果会被忽略，正常的结果会被保存到`list`中。如果最终没有返回结果，则直接返回一个空的`RpcResult`；如果只有一个结果， 那么也直接返
+
+​		回，不需要再做合并；如果返回类型是`void`，则说明没有返回值，也直接返回。
+
+​				6、合并结果集。如果配置的是`merger=".addAll"`，则直接通过反射调用返回类型中的`.addAll`方法合并结果集。
+
+
+
+​		在`Cluster`中，还有最后一个`MockClusterWrapper`，由它实现了`Dubbo`的本地伪装。这个功能的使用场景较多，通常会应用在以下场景中：服务降级；部分
+
+非关键服务全部不可用，希望主流程继续进行；在下游某些节点调用异常时，可以以`Mock`的结果返回。
+
+​		`Mock`只有在拦截到`RpcException`的时候会启用，属于异常容错方式的一种。业务层面其实也可以用`try-catch`来实现这种功能，如果使用下沉到框架中的
+
+`Mock`机制，则可以让业务的实现更优雅。
+
+![](image/QQ截图20211201094213.png)
+
+​		`MockClusterWrapper`是一个包装类，包装类会被自动注入合适的扩展点实现，它的逻辑很简单，只是把被包装扩展类作为初始化参数来创建并返回一个
+
+`MockClusterlnvoker`。
+
+​		`MockClusterlnvoker`和其他的`Clusterinvoker`一样，在`Invoker`方法中完成了主要逻辑。
+
+​		`MocklnvokersSelector`是`Router`接口 的一种实现，用于过滤出`Mock`的`Invoker`。
+
+​		`MockProtocol`根据用户传入的`URL`和类型生成一个`Mockinvoker`。
+
+​		`Mockinvoker`实现最终的`Invoker`逻辑。
+
+
+
+​		`MockClusterlnvoker`会处理一些`Class`级别的`Mock`逻辑，例如：选择调用哪些`Mock`类。`Mockinvoker`处理的是方法级别的`Mock`逻辑，如返回值。
+
+​		`MockClusterlnvoker`的`invoke`方法处理了主要逻辑：
+
+​				1、获取`Invoker`的`Mock`参数。该`Invoker`是在构造方法中传入的。如果该`Invoker`根本就没有配置`Mock`，则直接调用`Invoker`的`invoke`方法并把结
+
+​		果返回；如果配置了`Mock`参数，则进入下一步。
+
+​				2、判断参数是否以`force`开头，即判断是否强制`Mock`。如果是强制`Mock`，则进入`doMocklnvoke`逻辑。如果不以`force`开头，则进入失败后`Mock`的逻
+
+​		辑。
+
+​				3、失败后调用`doMocklnvoke`逻辑返回结果。在`try`代码块中直接调用`Invoker`的`invoke`方法，如果抛出了异常，则在`catch`代码块中调用
+
+​		`doMocklnvoke`逻辑。
+
+
+
+​		强制`Mock`和失败后`Mock`都会调用`doMocklnvoke`逻辑：
+
+​				1、通过`selectMocklnvoker`获得所有`Mock`类型的`Invoker`。`selectMocklnvoker`在对象的`attachment`属性中偷偷放进一个
+
+​		`invocation.need.mock=true`的标识。`directory`在`list`方法中列出所有`Invoker`的时候，如果检测到这个标识，则使用`MockinvokersSelector`来过滤
+
+​		`Invoker`，而不是使用普通`route`实现，最后返回`Mock`类型的`Invoker`列表。如果一个`Mock`类型的`Invoker`都没有返回，则通过`directory`的`URL`新创建
+
+​		一个`Mockinvoker`；如果有`Mock`类型的`Invoker`，则使用第一个。
+
+​				2、调用`Mockinvoker`的`invoke`方法。在`try-catch`中调用`invoke`方法并返回结果。如果出现了异常，并且是业务异常，则包装成一个`RpcResult`返
+
+​		回，否则返回`RpcException`异常。
+
+
+
+​		`MocklnvokersSelector`是`Router`接口的其中一种实现：
+
+​				1、判断是否需要做`Mock`过滤。如果`attachment`为空，或者没有`invocation.need.mock=true`的标识，则认为不需要做`Mock`过滤，进入步骤`2`；如果
+
+​		找到这个标识，则进入步骤`3`。
+
+​				2、获取非`Mock`类型的`Invoker`。遍历所有的`Invoker`，如果它们的`protocol`中都没有`Mock`参数，则整个列表直接返回。否则，把`protocol`中所有没
+
+​		有`Mock`标识的取出来并返回。
+
+​				3、获取`Mock`类型的`Invoker`。遍历所有的`Invoker`，如果它们的`protocol`中都没有`Mock`参数，则直接返回`null`。否则，把`protocol`中所有含有
+
+​		`Mock`标识的取出来并返回。
+
+
+
+​		在`Mockinvoker`的`invoke`方法中，主要处理逻辑如下：
+
+​				1、获取`Mock`参数值。通过`URL`获取`Mock`配置的参数，如果为空则抛出异常。优先会获取方法级的`Mock`参数；如果取不到， 则尝试以`mock`为`key`获
+
+​		取对应的参数值。
+
+​				2、处理参数值是`return`的配置。如果只配置了一个`return`，即`mock=return`，则返回一个空的`RpcResult`；如果`return`后面还跟了别的参数，则首
+
+​		先解析返回类型，然后结合`Mock`参数和返回类型，返回`Mock`值。现支持以下类型的参数：`Mock`参数值等于`empty`，根据返回类型返回`new xxx()`空对象；
+
+​		如果参数值是`null、true、false`，则直接返回这些值；如果是其他字符串，则返回字符串；如果是数字`、List、Map`类型，则返回对应的`JSON`串；如果都没
+
+​		匹配上， 则直接返回`Mock`的参数值。
+
+​				3、处理参数值是`throw`的配置。如果`throw`后面没有字符串，则包装成一个`RpcException`异常，直接抛出；如果`throw`后面有自定义的异常类，则使
+
+​		用自定义的异常类，并包装成一个`RpcException`异常抛出。
+
+​				4、处理`Mock`实现类。先从缓存中取，如果有则直接返回。如果缓存中没有，则先获取接口的类型，如果`Mock`的参数配置的是`true`或`default`，则尝
+
+​		试通过接口名`+Mock`查找`Mock`实现类，如果是其他配置方式，则通过`Mock`的参数值进行查找。
+
+
+
 
 
 
@@ -4456,3 +4609,4 @@ public class MainController {
 }
 ```
 
+​	
