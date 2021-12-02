@@ -4070,9 +4070,605 @@ protected static class WeightedRoundRobin {
 
 
 
+# 扩展点
+
+![](image/QQ截图20211202091615.png)
+
+## Proxy层扩展点
+
+​		`Proxy`层主要的扩展接口是`ProxyFactory`。远程调用的过程对开发者完全是透明的，就像本地调用一样。这正是由于`ProxyFactory`帮我们生成了代理类，当
+
+调用某个远程接口时，实际上使用的是代理类。
+
+![](image/QQ截图20211202092158.png)
+
+​		`Dubbo`中的`ProxyFactory`有两种默认实现：`Javassist`和`JDK`，用户可以自行扩展自己的实现，`Dubbo`选用`Javassist`作为默认字节码生成工具，主要是基
+
+于性能和使用的简易性考虑，`Javassist`的字节码生成效率相对于其他库更快，使用也更简单。
+
+```java
+/**
+	方法会根据 URL 中的 proxy 参数决定使用哪种字节码生成工具
+*/
+@SPI(value = "javassist", scope = FRAMEWORK)
+public interface ProxyFactory {
+
+    @Adaptive({PROXY_KEY})
+    <T> T getProxy(Invoker<T> invoker) throws RpcException;
+
+    @Adaptive({PROXY_KEY})
+    <T> T getProxy(Invoker<T> invoker, boolean generic) throws RpcException; // generic参数是为了标识这个代理是否是泛化调用
+
+    @Adaptive({PROXY_KEY})
+    <T> Invoker<T> getInvoker(T proxy, Class<T> type, URL url) throws RpcException;
+}
+```
+
+![](image/QQ截图20211202092446.png)
+
+​		`stub`比较特殊，它的作用是创建一个代理类，这个类可以在发起远程调用之前在消费者本地做一些事情，比如先读缓存。它可以决定要不要调用`Proxy`。
 
 
 
+## Registry层扩展点
+
+​		`Registry`层可以理解为注册层，这一层中最重要的扩展点就是`org.apache.dubbo.registry.RegistryFactory`整个框架的注册与服务发现客户端都是由这个扩
+
+展点负责创建的。该扩展点有`@Adaptive({"protocol"))`注解，可以根据`URL`中的`protocol`参数创建不同的注册中心客户端。因此，如果扩展了自定义的注册中
+
+心，那么只需要配置不同的`Protocol`即可。
+
+```java
+@SPI(scope = APPLICATION)
+public interface RegistryFactory {
+
+    @Adaptive({"protocol"})
+    Registry getRegistry(URL url);
+}
+```
+
+​		使用这个扩展点，还有一些需要遵循的规则：
+
+​				如果`URL`中设置了`check-false`，则连接不会被检查。否则，需要在断开连接时抛出异常。
+
+​				需要支持通过`usemame:password`格式在`URL`中传递鉴权。
+
+​				需要支持设置`backup`参数来指定备选注册集群的地址。
+
+​				需要支持设置`file`参数来指定本地文件缓存。
+
+​				需要支持设置`timeout`参数来指定请求的超时时间。
+
+​				需要支持设置`session`参数来指定连接的超时或过期时间。 
+
+​		在`Dubbo`，有`AbstractRegistryFactory`已经抽象了一些通用的逻辑，可以直接继承该抽象类实现自定义的注册中心工厂。
+
+![](image/QQ截图20211202094831.png)
+
+
+
+## Cluster层扩展点
+
+​		`Cluster`层负责了整个`Dubbo`框架的集群容错，涉及的扩展点较多，包括容错`(Cluster)`、 路由`(Router)`、负载均衡`(LoadBalance)`、配置管理工厂
+
+`(ConfiguratorFactory)`和合并器`(Merger)`。
+
+### Cluster扩展点
+
+​		`Cluster`主要负责一些容错的策略，也是整个集群容错的入口。当远程调用失败后，由`Cluster`负责重试、快速失败等，整个过程对上层透明。默认使用
+
+`Failover`机制。
+
+```java
+@SPI(Cluster.DEFAULT)
+public interface Cluster {
+
+    String DEFAULT = "failover";
+
+    @Adaptive
+    <T> Invoker<T> join(Directory<T> directory, boolean buildFilterChain) throws RpcException;
+
+    static Cluster getCluster(ScopeModel scopeModel, String name) {
+        return getCluster(scopeModel, name, true);
+    }
+
+    static Cluster getCluster(ScopeModel scopeModel, String name, boolean wrap) {
+        if (StringUtils.isEmpty(name)) {
+            name = Cluster.DEFAULT;
+        }
+        return ScopeModelUtil.getApplicationModel(scopeModel).getExtensionLoader(Cluster.class).getExtension(name, wrap);
+    }
+}
+```
+
+![](image/QQ截图20211202095645.png)
+
+
+
+### RouterFactory扩展点
+
+​		`RouterFactory`是一个工厂类，用于创建不同的`Router`。如果配置了路由规则`(`某个消费者只能调用某个几个服务提供者`)`，则`Router`会过滤其他服务提
+
+供者，只留下符合路由规则的服务提供者列表。
+
+​		现有的路由规则支持文件、脚本和自定义表达式等方式。接口上有`@Adaptive("protocol")`注解，会根据不同的`protocol`自动匹配路由规则。
+
+```java
+@SPI
+public interface RouterFactory {
+
+    @Adaptive("protocol")
+    Router getRouter(URL url);
+}
+```
+
+![](image/QQ截图20211202095940.png)
+
+
+
+### LoadBalance扩展点
+
+​		`LoadBalance`是`Dubbo`框架中的负载均衡策略扩展点，框架中已经内置随机`(Random)`、轮询`(RoundRobin)`、最小连接数`(LeastActive)`、
+
+一致性`Hash(ConsistentHash)`这几种负载均 衡的方式，默认使用随机负载均衡策略。`LoadBalance`主要负责在多个节点中，根据不同的负载均衡策略选择一个合
+
+适的节点来调用。
+
+```java
+@SPI(RandomLoadBalance.NAME)
+public interface LoadBalance {
+
+    @Adaptive("loadbalance")
+    <T> Invoker<T> select(List<Invoker<T>> invokers, URL url, Invocation invocation) throws RpcException;
+}
+```
+
+![](image/QQ截图20211202100236.png)
+
+
+
+### ConfiguratorFactory扩展点
+
+​		`ConfiguratorFactory`是创建配置实例的工厂类，现有`override`和`absent`两种工厂实现，分别会创建`OverrideConfigupato`和`AbsentConfigurator`两种配置
+
+对象。默认的两种实现，`OverrideConfigurator`会直接把配置中心中的参数覆盖本地的参数；`AbsentConfigurator`会先看本地是否存在该配置，没有则新增本地
+
+配置，如果己经存在则不会覆盖。
+
+```java
+@SPI
+public interface ConfiguratorFactory {
+
+    @Adaptive("protocol")
+    Configurator getConfigurator(URL url);
+}
+```
+
+​		该扩展点的方法上也有`@Adaptive("protocol")`注解，会根据`URL`中的`protocol`配置值使用不同的扩展点实现。
+
+![](image/QQ截图20211202100534.png)
+
+
+
+### Merger扩展点
+
+​		`Merger`是合并器，可以对并行调用的结果集进行合并，默认已经支持`map、set、list、byte`等`11`种类型的返回值。可以基于该扩展点，添加自定义类型的
+
+合并器。
+
+```java
+@SPI
+public interface Merger<T> {
+
+    T merge(T... items);
+}
+```
+
+![](image/QQ截图20211202100901.png)
+
+
+
+## Remote层扩展点
+
+​		`Remote`处于整个`Dubbo`框架的底层，涉及协议、数据的交换、网络的传输、序列化、线程池等，涵盖了一个远程调用的所有要素。
+
+​		`Remote`层是对`Dubbo`传输协议的封装，内部再划为`Transport`传输层和`Exchange`信息交换层。其中`Transport`层只负责单向消息传输，是对`Mina、Netty`等
+
+传输工具库的抽象。而`Exchange`层在传输层之上实现了`Request-Response`语义，这样可以在不同传输方式之上都能做到统一的请求`/`响应处理。`Serialize`层是
+
+`RPC`的一部分，决定了在消费者和服务提供者之间的二进制数据传输格式。不同的序列化库的选择会对`RPC`调用的性能产生重要影响，目前默认选择是`Hessian2`
+
+序列化。
+
+
+
+## Protocol层扩展点
+
+​		`Protocol`层主要包含四大扩展点，分别是`Protocol、Filter、ExporterListener`和`InvokerListener`。
+
+### Protocol扩展点
+
+​		`Protocol`是`Dubbo RPC`的核心调用层，具体的`RPC`协议都可以由`Protocol`点扩展。如果想增加一种新的`RPC`协议，则只需要扩展一个新的`Protocol`扩展点
+
+实现即可。
+
+```java
+@SPI(value = "dubbo", scope = ExtensionScope.FRAMEWORK)
+public interface Protocol {
+
+    int getDefaultPort(); // 当用户没有设置端口的时候，返回默认的端口
+
+    @Adaptive
+    <T> Exporter<T> export(Invoker<T> invoker) throws RpcException; // 把一个服务暴露成远程invocation
+
+    @Adaptive
+    <T> Invoker<T> refer(Class<T> type, URL url) throws RpcException; // 引用一个远程服务
+
+    void destroy(); // 销毁
+
+    default List<ProtocolServer> getServers() {
+        return Collections.emptyList();
+    }
+
+}
+```
+
+​		`Protocol`的每个接口会有一些规则：
+
+​				`export`方法：
+
+​						1、协议收到请求后应记录请求源`IP`地址。通过`RpcContext.getContext(). setRemoteAddress()`方法存入`RPC`上下文。
+
+​						2、`export`方法必须实现幕等，即无论调用多少次，返回的`URL`都是相同的。
+
+​						3、`Invoker`实例由框架传入，无须关心协议层。
+
+​				`refer`方法：
+
+​						1、当我们调用`refer`。方法返回`Invoker`对象的`invoke()`方法时，协议也需要相应地执行`invoke()`方法。这一点在设计自定义协议的`Invoker`时
+
+​				需要注意。
+
+​						2、正常来说`refer`。方法返回的自定义`Invoker`需要继承`Invoker`接口。
+
+​						3、当`URL`的参数有`check=false`时，自定义的协议实现必须不能抛出异常，而是在出现连接失败异常时尝试恢复连接。
+
+​				`destroy`方法：
+
+​						1、调用`destroy`方法的时候，需要销毁所有本协议暴露和引用的方法。
+
+​						2、需要释放所有占用的资源，如连接、端口等。
+
+​						3、自定义的协议可以在被销毁后继续导出和引用新服务。
+
+​		整个`Protocol`的逻辑由`Protocok、Exporter、Invoker`三个接口串起来。其中`Protocol`接口是入口，其实现封装了用来处理`Exporter`和`Invoker`的方法：
+
+​				`Exporter`代表要暴露的远程服务引用，`Protocol#export`方法是将服务暴露的处理过程，`Invoker`代表要调用的远程服务代理对象，`Protocol#refer`方
+
+​		法通过服务类型和`URL`获得要调用的服务代理。
+
+​				由于`Protocol`可以实现`Invoker`和`Exporter`对象的创建，因此除了作为远程调用对象的构造，还能用于其他用途，例如：可以在创建`Invoker`的时候
+
+​		对原对象进行包装增强，添加其他`Filter`进去，`ProtocolFilterWrapper`实现就是把`Filter`链加入`Invoker`。
+
+![](image/QQ截图20211202102432.png)
+
+![](image/QQ截图20211202102444.png)
+
+
+
+### Filter扩展点
+
+​		`Filter`是`Dubbo`的过滤器扩展点，可以自定义过滤器，在`Invoker`调用前后执行自定义的逻辑。在`Filter`的实现中，必须要调用传入的`Invoker`的`invoke`
+
+方法，否则整个链路就断了。
+
+```java
+@SPI(scope = ExtensionScope.MODULE)
+public interface Filter extends BaseFilter {
+}
+
+public interface BaseFilter {
+
+    Result invoke(Invoker<?> invoker, Invocation invocation) throws RpcException;
+
+    interface Listener {
+
+        void onResponse(Result appResponse, Invoker<?> invoker, Invocation invocation);
+
+        void onError(Throwable t, Invoker<?> invoker, Invocation invocation);
+    }
+}
+```
+
+
+
+### ExporterListener/lnvokerListener扩展点
+
+​		`ExporterListener`和`InvokerListener`这两个扩展点非常相似，`ExporterListener`是在暴露和取消暴露服务时提供回调；`InvokerListener`则是在服务的引
+
+用与销毁引用时提供回调。
+
+```java
+@SPI(scope = ExtensionScope.FRAMEWORK)
+public interface ExporterListener {
+
+    void exported(Exporter<?> exporter) throws RpcException;
+
+    void unexported(Exporter<?> exporter);
+}
+
+@SPI
+public interface InvokerListener {
+
+    void referred(Invoker<?> invoker) throws RpcException;
+
+    void destroyed(Invoker<?> invoker);
+}
+```
+
+
+
+## Exchange层扩展点
+
+​		`Exchange`层只有一个扩展点接口`Exchanger`，这个接口主要是为了封装请求`/`响应模式，默认的扩展点实现是
+
+`org.apache.dubbo.remoting.exchange.support.header.HeaderExchanger`。每个方法上都有`@Adaptive`注解，会根据`URL`中的`Exchanger`参数决定实现类。
+
+```java
+@SPI(value = HeaderExchanger.NAME, scope = ExtensionScope.FRAMEWORK)
+public interface Exchanger {
+
+    @Adaptive({Constants.EXCHANGER_KEY})
+    ExchangeServer bind(URL url, ExchangeHandler handler) throws RemotingException;
+
+    @Adaptive({Constants.EXCHANGER_KEY})
+    ExchangeClient connect(URL url, ExchangeHandler handler) throws RemotingException;
+}
+```
+
+
+
+## Transport层扩展点
+
+​		`Transport`层为了屏蔽不同通信框架的异同，封装了统一的对外接口。主要的扩展点接口有`Transporter、Dispatcher、Codec2`和`ChannelHandler`。
+
+​		其中，`ChannelHandler`主要处理连接相关的事件，例如：连接上、断开、发送消息、收到消息、出现异常等。虽然接口上有`@SPI`注解，但是在框架中实现类
+
+的使用却是直接`new`的方式。
+
+
+
+### Transporter扩展接口
+
+​		`Transporter`屏蔽了通信框架接口、实现的不同，使用统一的通信接口。
+
+```java
+@SPI(value = "netty", scope = ExtensionScope.FRAMEWORK)
+public interface Transporter {
+
+    @Adaptive({Constants.SERVER_KEY, Constants.TRANSPORTER_KEY})
+    RemotingServer bind(URL url, ChannelHandler handler) throws RemotingException;
+
+    @Adaptive({Constants.CLIENT_KEY, Constants.TRANSPORTER_KEY})
+    Client connect(URL url, ChannelHandler handler) throws RemotingException;
+}
+```
+
+​		`bind`方法会生成一个服务，监听来自客户端的请求；`connect`方法则会连接到一个服务。 两个方法上都有`@Adaptive`注解，首先会根据`URL`中`server`的参
+
+数值去匹配实现类，如果匹配不到则根据`transporter`参数去匹配实现类。默认的实现是`netty4`。
+
+![](image/QQ截图20211202103703.png)
+
+
+
+### Dispatcher扩展接口
+
+​		如果有些逻辑的处理比较慢，则需要使用线程池。因为`I/O`速度相对`CPU`是很慢的，如果不使用线程池，则线程会因为`I/O`导致同步阻塞等待。`Dispatcher`
+
+扩展接口通过不同的派发策略，把工作派发到不同的线程池，以此来应对不同的业务场景。
+
+```java
+@SPI(value = AllDispatcher.NAME, scope = ExtensionScope.FRAMEWORK)
+public interface Dispatcher {
+
+    @Adaptive({Constants.DISPATCHER_KEY, "dispather", "channel.handler"})
+    ChannelHandler dispatch(ChannelHandler handler, URL url);
+}
+```
+
+![](image/QQ截图20211202103854.png)
+
+
+
+### Codec2扩展接口
+
+​		`Codec2`主要实现对数据的编码和解码，但这个接口只是需要实现编码`/`解码过程中的通用逻辑流程，如解决半包、粘包等问题。该接口属于在序列化上封装
+
+的一层。
+
+```java
+@SPI(scope = ExtensionScope.FRAMEWORK)
+public interface Codec2 {
+
+    @Adaptive({Constants.CODEC_KEY})
+    void encode(Channel channel, ChannelBuffer buffer, Object message) throws IOException;
+
+    @Adaptive({Constants.CODEC_KEY})
+    Object decode(Channel channel, ChannelBuffer buffer) throws IOException;
+
+    enum DecodeResult {
+        NEED_MORE_INPUT, SKIP_SOME_INPUT
+    }
+}
+```
+
+![](image/QQ截图20211202104044.png)
+
+
+
+### ThreadPool扩展接口
+
+​		在`Transport`层由`Dispatcher`实现不同的派发策略，最终会派发到不同的`ThreadPool`中执行。`ThreadPool`扩展接口就是线程池的扩展。
+
+```java
+@SPI(value = "fixed", scope = ExtensionScope.FRAMEWORK)
+public interface ThreadPool {
+
+    @Adaptive({THREADPOOL_KEY})
+    Executor getExecutor(URL url);
+}
+```
+
+​		现阶段，框架中默认含有四种线程池扩展的实现：
+
+​				`fixed`：固定大小线程池，启动时建立线程，不关闭，一直持有。对应`org.apache.dubbo.common.threadpool.support.fixed.FixedThreadPool`类。
+
+​				`cached`：缓存线程池，空闲一分钟自动删除，需要时重建。对应`org.apache.dubbo.common.threadpool.support.cached.CachedThreadPool`类。
+
+​				`limited`：可伸缩线程池，但池中的线程数只会增长不会收缩。只增长不收缩的目的是为了避免收缩时突然来了大流量引起的性能问题。对应
+
+​		`org.apache.dubbo.common.threadpool.support.limited.LimitedThreadPool`类。
+
+​				`eager`：优先创建`Worker`线程池。在任务数量大于`corePoolSize`小于`maximumPoolSize`时，优先创建`Worker`来处理任务。当任务数量大于
+
+​		`maximumPoolSize`时，将任务放入阻塞队列。阻塞队列充满时抛出`RejectedExecutionException(cached`在任务数量超过`maximumPoolSize`时直接抛出异常而
+
+​		不是将任务放入阻塞队列`)`。对应`org.apache.dubbo.common.threadpool.support.eager.EagerThreadPool`类。
+
+
+
+## Serialize层扩展点
+
+​		`Serialize`层主要实现具体的对象序列化，只有`Serialization`一个扩展接口。`Serialization`是具体的对象序列化扩展接口，即把对象序列化成可以通过网
+
+络进行传输的二进制流。
+
+
+
+### Serialization 扩展接口
+
+​		`Serialization`就是具体的对象序列化：
+
+```java
+@SPI(value = "hessian2", scope = ExtensionScope.FRAMEWORK)
+public interface Serialization {
+
+    byte getContentTypeId();
+
+    String getContentType();
+
+    @Adaptive
+    ObjectOutput serialize(URL url, OutputStream output) throws IOException;
+
+    @Adaptive
+    ObjectInput deserialize(URL url, InputStream input) throws IOException;
+}
+```
+
+​		`Serialization`默认使用`Hessian2`做序列化。
+
+![](image/QQ截图20211202104831.png)
+
+![](image/QQ截图20211202104844.png)
+
+​		`compactedjava`是在`Java`原生序列化的基础上做了压缩，实现了自定义的类描写叙述符的写入和读取。在序列化的时候仅写入类名，而不是完整的类信息，
+
+这样在对象数量很多的情况下，可以有效压缩体积。
+
+​		`NativeJavaSerialization`是原生的`Java`序列化的实现方式。
+
+​		`JavaSerialization`是原生`Java`序列化及压缩的封装。
+
+
+
+## TelnetHandler扩展点
+
+​		`Dubbo`框架支持`Telnet`命令连接，`TelnetHandler`接口就是用于扩展新的`Telnet`命令的接口。
+
+```properties
+clear=org.apache.dubbo.remoting.telnet.support.command.ClearTelnetHandler
+exit=org.apache.dubbo.remoting.telnet.support.command.ExitTelnetHandler
+help=org.apache.dubbo.remoting.telnet.support.command.HelpTelnetHandler
+status=org.apache.dubbo.remoting.telnet.support.command.StatusTelnetHandler
+log=org.apache.dubbo.remoting.telnet.support.command.LogTelnetHandler
+```
+
+
+
+## StatusChecker扩展点
+
+​		通过这个扩展点，可以让`Dubbo`框架支持各种状态的检查，默认已经实现了内存和`load`的检查。用户可以自定义扩展，如硬盘、`CPU`等的状态检查。
+
+```properties
+memory=org.apache.dubbo.common.status.support.MemoryStatusChecker
+load=org.apache.dubbo.common.status.support.LoadStatusChecker
+```
+
+
+
+## Container扩展点
+
+​		服务容器就是为了不需要使用外部的`Tomcat、JBoss`等`Web`容器来运行服务，因为有可能服务根本用不到它们的功能，只是需要简单地在`main`方法中暴露一
+
+个服务即可。此时就可以使用服务容器。`Dubbo`中默认使用`Spring`作为服务容器。
+
+
+
+## CacheFactory扩展点
+
+​		可以通过`dubbo:method`配置每个方法的调用返回值是否进行缓存，用于加速数据访问速度。
+
+```properties
+threadlocal=org.apache.dubbo.cache.support.threadlocal.ThreadLocalCacheFactory
+lru=org.apache.dubbo.cache.support.lru.LruCacheFactory
+jcache=org.apache.dubbo.cache.support.jcache.JCacheFactory
+expiring=org.apache.dubbo.cache.support.expiring.ExpiringCacheFactory
+lfu=org.apache.dubbo.cache.support.lfu.LfuCacheFactory
+```
+
+​		`Iru`：基于最近最少使用原则删除多余缓存，保持最热的数据被缓存。
+
+​		`threadlocal`：当前线程缓存，比如一个页面渲染，用到很多`portal`，每个`portal`都要去查用户信息，通过线程缓存可以减少这种多余访问。
+
+​		`jcache`：与`JSR107`集成，可以桥接各种缓存实现。
+
+​		`expiring`：实现了会过期的缓存，有一个守护线程会一直检查缓存是否过期。
+
+
+
+## Validation扩展点
+
+​		该扩展点主要实现参数的校验，可以在配置中使用`<dubbo:service validation="校验实现名" />`实现参数的校验。己知的扩展实现有
+
+`org.apache.dubbo.validation.support.jvalidation.JValidation`，扩展`key`为`jvalidation`。
+
+
+
+## LoggerAdapter扩展点
+
+​		日志适配器主要用于适配各种不同的日志框架，使其有统一的使用接口。
+
+```properties
+slf4j=org.apache.dubbo.common.logger.slf4j.Slf4jLoggerAdapter
+jcl=org.apache.dubbo.common.logger.jcl.JclLoggerAdapter
+log4j=org.apache.dubbo.common.logger.log4j.Log4jLoggerAdapter
+jdk=org.apache.dubbo.common.logger.jdk.JdkLoggerAdapter
+log4j2=org.apache.dubbo.common.logger.log4j2.Log4j2LoggerAdapter
+```
+
+
+
+## Compiler扩展点
+
+​		`@Adaptive`注解会生成`Java`代码，然后使用编译器动态编译出新的`Class`。`Compiler`接口就是可扩展的编译器。
+
+```properties
+adaptive=org.apache.dubbo.common.compiler.support.AdaptiveCompiler
+jdk=org.apache.dubbo.common.compiler.support.JdkCompiler
+javassist=org.apache.dubbo.common.compiler.support.JavassistCompiler
+```
 
 
 
