@@ -4672,6 +4672,327 @@ javassist=org.apache.dubbo.common.compiler.support.JavassistCompiler
 
 
 
+# 高级特性
+
+![](image/QQ截图20211203091459.png)
+
+## 服务分组和版本
+
+​		`Dubbo`中提供的服务分组和版本是强隔离的，如果服务指定了服务分组和版本，则消费方调用也必须传递相同的分组名称和版本名称。 
+
+```java
+@DubboService(version = "1.0",group = "1.0")
+public class UserInfoServiceImpl implements UserInfoService {
+    ...
+}
+
+public class CousmerConfig {
+    @DubboReference(version = "1.0",group = "1.0")
+    private UserInfoService userInfoService;
+}
+```
+
+​		当服务提供方进行服务暴露时，服务端会根据`serviceGroup/serviceName:serviceversion:port`组合成`key`，然后服务实现作为`value`保存在`DubboProtocol`
+
+类的`exporterMap`字段中。这个字段是一个`HashMap`对象，当服务消费调用时，根据消费方传递的服务分组、服务接口、版本号和服务暴露时的协议端口号重新构
+
+造这个`key``，然后从内存`Map`中查找对应实例进行调用。 
+
+​		当客户端指定了分组和版本时，在`Dubbolnvoker`构造函数中会将`URL`中包含的接口、分组、`Token`和`timeout`加入`attachment`，同时将接口上的版本号存储
+
+在`version`字段。当发起`RPC`请求时，通过`DubboCodec`把这些信息发送到服务器端，服务器端收到这些关键信息后重新组装成`key`，然后查找业务实现并调用。
+
+​		当`Dubbo`客户端启动时，实际上会把调用接口所有的协议节点都拉取下来，然后根据本地`URL`配置的接口、`category`、分组和版本做过滤，具体过滤是在注
+
+册中心层面实现的。
+
+
+
+## 参数回调
+
+​		`Dubbo`支持异步参数回调，当消费方调用服务端方法时，允许服务端在某个时间点回调回客户端的方法。在服务端回调到客户端时，服务端不会重新开启
+
+`TCP`连接，会复用已经建立的从客户端到服务端的`TCP`连接。
+
+```xml
+<beans xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xmlns:dubbo="http://dubbo.apache.org/schema/dubbo"
+       xmlns="http://www.springframework.org/schema/beans" xmlns:context="http://www.springframework.org/schema/context"
+       xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd
+       http://dubbo.apache.org/schema/dubbo http://dubbo.apache.org/schema/dubbo/dubbo.xsd http://www.springframework.org/schema/context http://www.springframework.org/schema/context/spring-context.xsd">
+    <context:property-placeholder/>
+    <dubbo:application name="callback-provider"/>
+    <dubbo:registry address="zookeeper://${zookeeper.address:127.0.0.1}:2181"/>
+    <dubbo:protocol name="dubbo" port="20880"/>
+    <dubbo:provider token="true"/>
+    <bean id="callbackService" class="org.apache.dubbo.samples.callback.impl.CallbackServiceImpl"/>
+    <dubbo:service interface="org.apache.dubbo.samples.callback.api.CallbackService" ref="callbackService"
+                   connections="1" callbacks="1000">
+        <dubbo:method name="addListener">
+            <dubbo:argument index="1" callback="true"/>
+        </dubbo:method>
+    </dubbo:service>
+</beans>
+```
+
+```xml
+<beans xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xmlns:dubbo="http://dubbo.apache.org/schema/dubbo"
+       xmlns="http://www.springframework.org/schema/beans" xmlns:context="http://www.springframework.org/schema/context"
+       xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd
+       http://dubbo.apache.org/schema/dubbo http://dubbo.apache.org/schema/dubbo/dubbo.xsd http://www.springframework.org/schema/context http://www.springframework.org/schema/context/spring-context.xsd">
+    <context:property-placeholder/>
+    <dubbo:application name="callback-consumer"/>
+    <dubbo:registry address="zookeeper://${zookeeper.address:127.0.0.1}:2181"/>
+    <dubbo:reference id="callbackService" interface="org.apache.dubbo.samples.callback.api.CallbackService"/>
+</beans>
+```
+
+```java
+public class CallbackServiceImpl implements CallbackService {
+    private final Map<String, CallbackListener> listeners = new ConcurrentHashMap<String, CallbackListener>();
+
+    public CallbackServiceImpl() {
+        Thread t = new Thread(() -> {
+            while (true) {
+                try {
+                    for (Map.Entry<String, CallbackListener> entry : listeners.entrySet()) {
+                        try {
+                            entry.getValue().changed(getChanged(entry.getKey()));
+                        } catch (Throwable t1) {
+                            listeners.remove(entry.getKey());
+                        }
+                    }
+                    Thread.sleep(5000); // timely trigger change event
+                } catch (Throwable t1) {
+                    t1.printStackTrace();
+                }
+            }
+        });
+        t.setDaemon(true);
+        t.start();
+    }
+
+    @Override
+    public void addListener(String key, CallbackListener listener) {
+        listeners.put(key, listener);
+        listener.changed(getChanged(key)); // send notification for change
+    }
+
+    private String getChanged(String key) {
+        return "Changed: " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date());
+    }
+}
+```
+
+```java
+public class CallbackConsumer {
+
+    public static void main(String[] args) throws Exception {
+        ClassPathXmlApplicationContext context = new ClassPathXmlApplicationContext("spring/callback-consumer.xml");
+        context.start();
+        CallbackService callbackService = context.getBean("callbackService", CallbackService.class);
+        callbackService.addListener("foo.bar", msg -> System.out.println("callback:" + msg));
+    }
+
+}
+```
+
+​		服务提供方要想实现回调，就需要指定回调方法参数是否为回调，对于客户端消费方来说没有任何区别
+
+​		客户端在启动时，会拉取服务`Callbackservice`元数据， 因为服务端配置了异步回调信息，这些信息会透传给客户端。客户端在编码请求时，会发现第`2`个
+
+方法参数为回调对象。此时，客户端会暴露一个`Dubbo`协议的服务，服务暴露的端口号是本地`TCP`连接自动生成的端口。在客户端暴露服务时，会将客户端回调参
+
+数对象内存`id`存储在`attachment`中，对应的`key`为`sys_callback_arg-`回调参数索引。这个`key`在调用普通服务`addListener`时会传递给服务端，服务端回调客
+
+户端时，会把这个`key`对应的值再次放到`attachment`中传给客户端。从服务端回调到客户端的`attachment`会用`keycallback.service.instid`保存回调参数实例
+
+`id`，用于查找客户端暴露的服务。
+
+​		客户端调用服务端方法时，并不会把第`2`个异步参数实例序列化并传给服务端。当服务端解码时，会先检查参数是不是异步回调参数。如果发现是异步参数
+
+回调，那么在服务端解码参数值时，会自动创建到消费方的代理。服务端创建回调代理实例`Invoker`类型是`ChannelWrappedlnvoker`，比较特殊的是，构造函数的
+
+`service`值是客户端暴露对象`id`，当回调发生时，会把`keycallback.service.instid`保存的对象`id`传给客户端，这样就能正确地找到客户端暴露的服务了。
+
+
+
+## 隐式参数
+
+​		`Dubbo`服务提供者或消费者启动时，配置元数据会生成`URL`, 一般是不可变的。在很多实际的使用场景中，在服务运行期需要动态改变属性值。`Dubbo`框架支
+
+持消费方在`RpcContext#setAttachment`方法中设置隐式参数，在服务端`RpcContext#getAttachment`方法中获取隐式传递。
+
+​		当客户端发起调用前，设置隐藏参数，框架会在拦截器中把当前线程隐藏参数传递到`Rpclnvocation`的`attachment`中，服务端在拦截器中提取隐藏参数并设
+
+置到当前线程`RpcContext`中。
+
+![](image/QQ截图20211203101528.png)
+
+​		在消费方调用服务方传递隐式参数时，会在`Abstractlnvoker#invoke`方法调用中合并`RpcContext#getAttachments()`参数。用户的隐式参数会被合并到
+
+`Rpclnvocation`中的`attachment`字段，这个字段发送给服务端。在服务提供方收到请求时，在`ContextFilter#invoke`中提取`Rpclnvocation`中的`attachment`信
+
+息，并设置到当前线程上下文中。因为后端业务方法调用和拦截器在同一个线程中执行，所以直接使用`RpcContext.getContext().getAttachment`获取值即可。
+
+
+
+## 异步调用
+
+​		在客户端实现异步调用非常简单，在消费接口时配置异步标识，在调用时从上下文中获取`Future`对象，在期望结果返回时再调用阻塞方法`Future.get()`即
+
+可。
+
+![](image/QQ截图20211203102428.png)
+
+
+
+## 泛化调用
+
+​		`Dubbo`泛化调用特性可以在不依赖服务接口`API`包的场景中发起远程调用。这种特性特别适合框架集成和网关类应用开发。`Dubbo`在客户端发起泛化调用并
+
+不要求服务端是泛化暴露。
+
+​		服务端在处理服务调用时，在`GenericFilter`拦截器中先把`Rpclnvocation`中传递过来的参数类型和参数值提取出来，然后根据传递过来的接口名、 方法名
+
+和参数类型查找服务端被调用的方法。获取真实方法后，主要提取真实方法参数类型`(`可能包含泛化类型`)`，然后将参数值做`Java`类型转换。最后用解析后的参
+
+数值构造新的`Rpclnvocation`对象发起调用。
+
+
+
+## 上下文信息
+
+​		`Dubbo`上下文信息的获取和存储同样是基于`JDK`的`ThreadLocal`实现的。上下文中存放的是当前调用过程中所需的环境信息。`RpcContext`是一个
+
+`ThreadLocal`的临时状态记录器，当收到或发送`RPC`时，当前线程关联的`RpcContext`状态都会变化。
+
+​		在客户端和服务端分别有一个拦截设置当前上下文信息，对应的分别为`ConsumerContextFilter`和`ContextFilter`。在客户端拦截器实现中，因为`Invoker`包
+
+含远程服务信息，因此直接设置远程`IP`等信息。在服务端拦截器中主要设置本地地址，这个时候无法获取远程调用地址。设置远程地址主要在
+
+`DubboProtocol#ExchangeHandlerAdapter.reply`方法中完成，可以直接通过`channel.getRemoteAddress`方法获取。
+
+
+
+## Telnet操作
+
+​		`Dubbo`支持通过`Telnet`登录进行简单的运维。
+
+​		`ls`主要提供了查询已经暴露的服务列表、查询服务详细信息和查询指定服务接口信息等功能。实现主要基于`ListTelnetHandler`，`Dubbo`框架的`Telnet`调用
+
+只对`Dubbo`协议提供支持。它的原理非常简单，当服务端收到`ls`命令和参数时，会加载`ListTelnetHandler`并执行， 然后触发
+
+`DubboProtocol.getDubboProtocol().getExporters()`方法获取所有已经暴露的服务， 获取暴露的接口名和暴露服务别名`(path`属性`)`进行匹配，将匹配的结果进
+
+行输出。如果是查看服务暴露的方法，则框架会获取暴露接口名，然后反射获取所有方法并输出。
+
+
+
+​		`ps`命令用于查看提供服务本地端口的连接情况。实现类对应`PortTelnetHandler`类，当`Dubbo`服务暴露时，会把关联端口的服务端实例加入`DubboProtocol`
+
+类的`serverMap`字段。当执行`ps`命令时，`PortTelnetHandler`类会通过`DubboProtocol.getDubboProtocol().getServers()`提取暴露的`server`实例。它持有了端口
+
+号和所有客户端连接信息等。当无法确认命令对应的后端实现时，可以查找和扩展点名称相同的文件, 它包含扩展点所有的实现定义。
+
+
+
+​		`trace`用于统计服务方法的调用信息。对应的实现类是`TraceTelnetHandler`，它本身不会执行任何方法调用，首先根据传递的接口和方法查找对应的
+
+`Invoker`，然后把当前的`Telnet`连接`(Channel`、接口、方法和最大执行次数信息记录在`TraceFilter`中，当接口方法被调用时，`TraceFilter`会取出对应的
+
+`Telnet`连接`(Channel)`，并把调用结果信息发送的`Telnet`客户端。
+
+
+
+​		`count`命令也用于统计服务信息，但它主要统计方法调用成功数、失败数、正在并发执行数、平均耗时和最大耗时。如果在服务方暴露服务时配置了
+
+`executes`属性，那么使用`count`命令可以统计并发调用信息。对应的实现类是`CountTelnetHandler`，每次执行`count`命令时在服务端会启动一个线程去循环统计
+
+当前调用次数。框架会使用`RpcStatus`类记录并发调用信息，`CountTelnetHandler`负责提取这些统计信息并输出给`Telnet`客户端。
+
+
+
+## Mock调用
+
+​		`Dubbo`提供服务容错的能力，通常用于服务降级。
+
+​		当`Dubbo`服务提供者调用抛出`RpcException`时，框架会降级到本地`Mock`伪装。当直接指定`mock=true`时， 客户端启动时会查找`Mock`类。查找规则根据接口
+
+名加`Mock`后缀组合成新的实现类，当然也可以使用自己的`Mock`实现类指定给`mock`属性。
+
+​		当在`Mock`中指定`return null`时,允许调用失败返回空值。
+
+​		当在`Mock`中指定`throw`或`throw`自定义异常类时，分别会抛出即`RpcException`和用户自定义异常。目前默认场景都是在没有服务提供者或调用失败时，触发
+
+`Mock`调用，如果不想发起`RPC`调用直接使用`Mock`数据，则需要在配置中指定`force:`语法。
+
+​		处理`Mock`伪装对应的实现类是`MockClusterlnvoker`，因为`MockClusterWrapper`是对扩展点`Cluster`的包装，当框架在加载`Cluster`扩展点时会自动使用
+
+`MockClusterWrapper`类对`Cluster`实例进行包装`(`默认是`FailoverCluster)`。
+
+```java
+	public Result invoke(Invocation invocation) throws RpcException {
+        Result result;
+
+        String value = getUrl().getMethodParameter(invocation.getMethodName(), MOCK_KEY, Boolean.FALSE.toString()).trim();
+        if (value.length() == 0 || "false".equalsIgnoreCase(value)) {
+            //no mock
+            result = this.invoker.invoke(invocation); // 如果没有指定Mock,则不需要本地伪装
+
+        } else if (value.startsWith(FORCE_KEY)) {
+            if (logger.isWarnEnabled()) {
+                logger.warn("force-mock: " + invocation.getMethodName() + " force-mock enabled , url : " + getUrl());
+            }
+            //force:direct mock
+            result = doMockInvoke(invocation, null); // 指定了 force,不发起 RPC 调用，直接本地伪装
+        } else {
+            //fail-mock
+            try {
+                result = this.invoker.invoke(invocation); // 配置了 Mock,先发起 RPC 调用
+
+                //fix:#4585
+                if(result.getException() != null && result.getException() instanceof RpcException){
+                    RpcException rpcException= (RpcException)result.getException();
+                    if(rpcException.isBiz()){
+                        throw  rpcException;
+                    }else {
+                        result = doMockInvoke(invocation, rpcException); 
+                    }
+                }
+
+            } catch (RpcException e) {
+                if (e.isBiz()) {
+                    throw e;
+                }
+
+                if (logger.isWarnEnabled()) {
+                    logger.warn("fail-mock: " + invocation.getMethodName() + " fail-mock enabled , url : " + getUrl(), e);
+                }
+                result = doMockInvoke(invocation, e); // 调用报错，降级 Mock 伪装
+            }
+        }
+        return result;
+    }
+```
+
+
+
+## 结果缓存
+
+​		`Dubbo`框架提供了对服务调用结果进行缓存的特性，用于加速热门数据的访问速度，`Dubbo`提供声明式缓存，以减少用户加缓存的工作量。因为每次调用都
+
+会使用`JSON.toJSONString`方法将请求参数转换成字符串，然后拼装唯一的`key`，用于缓存唯一键。如果不能接受缓存造成的开销，则谨慎使用这个特性。 
+
+​		`lru`缓存策略是框架默认使用的。它的原理比较简单，缓存对应实现类是`LRUCache`。缓存实现类`LRUCache`继承了`JDK`的`LinkedHashMap`类， 
+
+`LinkedHashMap`是基于链表的实现，它提供了钩子方法`removeEldestEntry`，它的返回值用于判断每次向集合中添加元素时是否应该删除最少访问的元素。
+
+`LRUCache`重写了这个方法，当缓存值达到`1000`时，这个方法会返回`true`，链表会把头部节点移除。链表每次添加数据时都会在队列尾部添加，因此队列头部就
+
+是最少访问的数据`(LinkedHashMap`在更新数据时，会把更新数据更新到列表尾部`)`。
+
 
 
 
