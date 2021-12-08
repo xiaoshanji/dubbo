@@ -4997,6 +4997,240 @@ public class CallbackConsumer {
 
 
 
+# 过滤器
+
+​		`Dubbo`中的过滤器和`Web`应用中的过滤器的概念是一样的，提供了在服务调用前后插入自定义逻辑的途径。过滤器提供了服务提供者和消费者调用过程的拦
+
+截，即每次执行`RPC`调用的时候，对应的过滤器都会生效。虽然过滤器的功能强大，但由于每次调用时都会执行，因此在使用的时候需要注意它对性能的影响。
+
+![](image/QQ截图20211208085248.png)
+
+​		配置上的一些规则：
+
+​				过滤器顺序：
+
+​						用户自定义的过滤器的顺序默认会在框架内置过滤器之后，可以使用`filter="xxx,default"`这种配置方式让自定义的过滤器顺序靠前。
+
+​						在配置`filter="xxx,yyy"`时，写在前面的`xxx`会比`yyy`的顺序要靠前。
+
+​				剔除过滤器：
+
+​						对于一些默认的过滤器或自动激活的过滤器，有些方法不想使用这些过滤器，则可以使用加过滤器名称来过滤，如`filter="-xxFilter"`会让
+
+​				`xxFilter`不生效。如果不想使用所有默认启用的过滤器，则可以配置`filter="-defaulf"`来进行剔除。
+
+​				过滤器的叠加：
+
+​						如果服务提供者、消费者端都配置了过滤器，则两边的过滤器不会互相覆盖，而是互相叠加，都会生效。如果需要覆盖，则可以在消费方使用
+
+​				`"-"`的方式剔除对应的过滤器。
+
+![](image/QQ截图20211208091421.png)
+
+​		所有的过滤器会被分为消费者和服务提供者两种类型，消费者类型的过滤器只会在服务引用时被加入`Invoker`，服务提供者类型的过滤器只会在服务暴露的时
+
+候被加入对应的`Invoker`。`MonitorFilter`比较特殊，它会同时在暴露和引用时被加入`Invoker`。
+
+![](image/QQ截图20211208091647.png)
+
+
+
+## 过滤器链初始化
+
+​		在服务的暴露与引用过程中，会使用`DefaultFilterChainBuilder#buildInvokerChain`方法组装整个过滤器链。
+
+```java
+	@Override
+    public <T> Exporter<T> export(Invoker<T> invoker) throws RpcException { // 暴露服务的时候会调用 buildlnvokerChain
+        if (UrlUtils.isRegistry(invoker.getUrl())) {
+            return protocol.export(invoker);
+        }
+        FilterChainBuilder builder = getFilterChainBuilder(invoker.getUrl());
+        return protocol.export(builder.buildInvokerChain(invoker, SERVICE_FILTER_KEY, CommonConstants.PROVIDER)); //此处会传入CommonConstants.PROVIDER,标识自己是服务提供者类型的调用链
+    }
+
+    @Override
+    public <T> Invoker<T> refer(Class<T> type, URL url) throws RpcException { // 引用远程服务的时候也会调用 buildlnvokerChain
+        if (UrlUtils.isRegistry(url)) {
+            return protocol.refer(type, url);
+        }
+        FilterChainBuilder builder = getFilterChainBuilder(url);
+        return builder.buildInvokerChain(protocol.refer(type, url), REFERENCE_FILTER_KEY, CommonConstants.CONSUMER); // 此处会传入CommonConstants.CONSUMER,标识自己是消费类型的调用链
+    }
+```
+
+
+
+​		`buildlnvokerChain`方法构造调用链的，总的来说可以分为两步：
+
+​				1、获取并遍历所有过滤器。通过`ExtensionLoader#getActivateExtension`方法获取所有的过滤器并遍历。
+
+​				2、使用装饰器模式，增强原有`Invoker`，组装过滤器链。使用装饰器模式，把过滤器一个又一个地套到`Invoker`上。
+
+```java
+	@Override
+    public <T> Invoker<T> buildInvokerChain(final Invoker<T> originalInvoker, String key, String group) {
+        Invoker<T> last = originalInvoker; // 保存引用，后续用于把真正的调用者保存到过滤器链的最后
+        URL url = originalInvoker.getUrl();
+        List<Filter> filters = ScopeModelUtil.getExtensionLoader(Filter.class, url.getScopeModel()).getActivateExtension(url, key, group); // 获取所有的过滤器，包括有@Activate注解默认启动的和用户在XML中自定义配置的
+
+        if (!filters.isEmpty()) {
+            for (int i = filters.size() - 1; i >= 0; i--) { // 对过滤器做倒排遍历，即从尾到头
+                final Filter filter = filters.get(i);
+                final Invoker<T> next = last; // 把 last 节点变成 next 节点，并放到 Filter 链的 next 中
+                last = new FilterChainNode<>(originalInvoker, next, filter);
+            }
+        }
+
+        return last;
+    }
+
+	
+	// FilterChainBuilder$FilterChainNode
+	public Result invoke(Invocation invocation) throws RpcException {
+            Result asyncResult;
+            try {
+                asyncResult = filter.invoke(nextNode, invocation); // 设置过滤器链的下一个节点，不断循环形成过滤器链
+            } catch (Exception e) {
+                ...
+            } finally {
+
+            }
+            return asyncResult.whenCompleteWithContext((r, t) -> { // 异步调用和同步调用的处理|
+                if (filter instanceof ListenableFilter) {
+                    ListenableFilter listenableFilter = ((ListenableFilter) filter);
+                    Filter.Listener listener = listenableFilter.listener(invocation);
+                    try {
+                        if (listener != null) {
+                            if (t == null) {
+                                listener.onResponse(r, originalInvoker, invocation);
+                            } else {
+                                listener.onError(t, originalInvoker, invocation);
+                            }
+                        }
+                    } finally {
+                        listenableFilter.removeListener(invocation);
+                    }
+                } else if (filter instanceof FILTER.Listener) {
+                    FILTER.Listener listener = (FILTER.Listener) filter;
+                    if (t == null) {
+                        listener.onResponse(r, originalInvoker, invocation);
+                    } else {
+                        listener.onError(t, originalInvoker, invocation);
+                    }
+                }
+            });
+        }
+```
+
+
+
+## 服务提供者过滤器
+
+​		通过在`@Activate`注解上可以设置`group`属性，从而设定某些过滤器只有在服务提供者端才生效。
+
+### AccessLogFilter
+
+​		`AccessLogFilter`是一个日志过滤器，如果想记录服务每一次的请求日志，则可以开启这个过滤器。虽然`AccessLogFilter`有`@Activate`注解，默认会被激
+
+活，但还是需要手动配置来开启日志的打印。
+
+![](image/QQ截图20211208095237.png)
+
+​		在`AccessLogFilter`的构造方法中会加锁并初始化一个定时线程池`ScheduledThreadPool`。该线程池只有在指定了输出的`log`文件时才会用到，
+
+`ScheduledThreadPool`中的线程会定时把队列中的日志数据写入文件。在构造方法中主要是初始化线程池。
+
+​		打印日志的逻辑主要在`invoke`方法中：
+
+​				1、获取参数。获取上下文、接口名、版本、分组信息等参数，用于日志的构建。
+
+​				2、构建日志字符串。根据步骤`1`中的数据开始组装日志，最终会得到一个日志字符串。
+
+​				3、日志打印。如果用户配置了使用应用本身的日志组件，则直接通过封装的`LoggerFactory`打印日志；如果用户配置了日志要输出到自定义的文件中，
+
+​		则会把日志加入一个`ConcurrentHashMap<String, ConcurrentHashSet<AccessLogData>>`中暂存，`key`是自定义的`accesslog`值，`value`就是对应的日志集
+
+​		合。后续等待定时线程不断遍历整个`Map`，把日志写入对应的文件。首先由于`Set`集合是无序的，因此日志输出到文件也是无序的； 其次由于是异步刷盘，
+
+​		突然宕机会导致一小部分日志丢失。
+
+
+
+### ExecuteLimitFilter
+
+​		`ExecuteLimitFilter`用于限制每个服务中每个方法的最大并发数，有接口级别和方法级别的配置方式。
+
+![](image/QQ截图20211208095926.png)
+
+​		如果不设置，则默认不做限制；如果设置了小于等于`0`的数值，那么也会不做任何限制。
+
+​		原理是：在框架中使用一个`ConcurrentMap`缓存了并发数的计数器。为每个请求`URL`生成一个`IdentityString`，并以此为`key`；再以每个`IdentityString`生
+
+成一个`RpcStatus`对象，并以此为`value`。`RpcStatus`对象用于记录对应的并发数。在过滤器中，会以`try-catch-finally`的形式调用过滤器链的下一个节点。因
+
+此，在开始调用之前，会通过`URL`获得`RpcStatus`对象，把对象中的并发数计数器原子`+1`，在`finally`中再将原子`-1`。只要在计数器`+1`的时候，发现当前计数
+
+比设置的最大并发数大时，就会抛出异常，提示己经超过最大并发数，请求就会被终止并直接返回。
+
+
+
+### ClassLoaderFilter
+
+​		`ClassLoaderFilter`主要的工作是：切换当前工作线程的类加载器到接口的类加载器，以便和接口的类加载器的上下文一起工作。
+
+```java
+	public Result invoke(Invoker<?> invoker, Invocation invocation) throws RpcException {
+        ClassLoader ocl = Thread.currentThread().getContextClassLoader(); // 保存当前线程的类加载器
+        Thread.currentThread().setContextClassLoader(invoker.getInterface().getClassLoader()); // 把当前线程的上下文类加载器设置为接口的类加载器
+        try {
+            return invoker.invoke(invocation); // 继续过滤器链的下一个节点
+        } finally {
+            Thread.currentThread().setContextClassLoader(ocl); // 把当前线程的上下文类加载器还原回去
+        }
+    }
+```
+
+
+
+### ContextFilter
+
+​		`ContextFilter`主要记录每个请求的调用上下文。每个调用都有可能产生很多中间临时信息， 不可能要求在每个接口上都加一个上下文的参数，然后一路往
+
+下传。通常做法都是放在`ThreadLocal`中，作为一个全局参数，当前线程中的任何一个地方都可以直接读`/`写上下文信息。
+
+​		`ContextFilter`就是统一在过滤器中处理请求的上下文信息，它为每个请求维护一个`RpcContext`对象，该对象中维护两个`InternalThreadLocal`，分别记录
+
+`local`和`server`的上下文。每次收到或发起`RPC`调用的时候，上下文信息都会发生改变。
+
+​		发起调用时候的上下文是由`ConsumerContextFilter`实现的，这个是消费者端的过滤器，`ContextFilter`保存的是收到的请求的上下文。
+
+​		`ContextFilter`的主要逻辑：
+
+​				1、清除异步属性。防止异步属性传到过滤器链的下一个环节。
+
+​				2、设置当前请求的上下文，如`Invoker`信息、地址信息、端口信息等。如果前面的过滤器已经对上下文设置了一些附件信息，则和`Invoker`的附件信息
+
+​		合并。
+
+​				3、调用过滤器链的下一个节点。
+
+​				4、清除上下文信息。对于异步调用的场景，即使是同一个线程，处理不同的请求也会创建一个新的`RpcContext`对象。因此调用完成后，需要清理对应
+
+​		的上下文信息。
+
+
+
+### ExceptionFilter
+
+​		对于所有没有声明`Unchecked`的方法抛出的异常，`ExceptionFilter`会把未引入的异常包装到`RuntimeException`中，并把异常原因字符串化后返回。
+
+
+
+
+
+
+
 
 
 
