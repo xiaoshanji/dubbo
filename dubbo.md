@@ -5249,6 +5249,82 @@ public class CallbackConsumer {
 
 
 
+# 服务治理平台
+
+​		项目地址：[https://github.com/apache/dubbo-admin](https://github.com/apache/dubbo-admin)
+
+​		服务治理平台包含服务治理的功能，前端通过`REST`接口请求后端服务，后端`Controller`收到对应请求后调用`Service`处理具体逻辑。
+
+## 服务搜索的实现
+
+​		服务搜索是通过不同的过滤条件，在本地的注册数据缓存里，查找出合适的结果集。抽象父类通过一个工具类`RegistryServerSync`实现的，它继承了两个
+
+`Spring`接口和一个`Dubbo`注册中心接口：
+
+![](image/QQ截图20211210091845.png)
+
+​				1、在`Bean`初始化时，在`afterPropertiesSet()`方法中会订阅注册中心。直接调用注册中心模块的`registryService#subscribe`订阅，把`this`传入并作
+
+​		为监听者，因为`RegistryServerSync`也实现了监听接口。
+
+​				2、监听到变化时候，通过`notify(List urls)`方法更新本地的缓存数据。对于`empty`协议的变更，如果服务配置的`group`和`version`的值是`*`，则清空
+
+​		所有本地的这个节点；如果指定了特定的`group`和`version`，则只删除指定的节点。对于非`empty`协议的变更，则把数据按照类目、`ServiceKey`两种维度分
+
+​		别保存一份，更新本地缓存。`ServiceKey`的规则是：`group + '/' + `接口名` + version`。
+
+​				3、`Bean`被`Spring`容器销毁时，在`destroy()`方法中会取消订阅注册中心，直接调用`registryService#unsubscribe`取消订阅。 
+
+
+
+## override特性的实现
+
+​		`override`特性主要使用在动态参数的更新上，各个节点监听到注册中心的参数发生变化，从而更新本地的参数信息。`override`类型的`URL`是以`override://`
+
+开头的，允许整个`URL`中只有部分属性变化，监听者监听到变化后会做部分更新。
+
+​				1、新增。把`override`对象转换成`URL`，通过`registryservice.register(url)`把`URL`注册到注册中心。
+
+​				2、修改。根据`Hash`值找到老的`URL`，如果没找到则说明数据己经被修改，抛出异常；如果找到了，则先取消注册老的`URL`，再注册新的`URL`。
+
+​				3、删除。先根据`id`获取老的`URL`，再直接取消注册老的`URL`。
+
+​				4、启用`/`禁用。首先根据`id`获取老的`URL`，在新`URL`的`params`属性里把`enabled`设置为`true`或`false`，然后取消注册老的`URL`,最后注册新的
+
+​		`URL`。
+
+
+
+## route的实现
+
+​		`route`规则可以为不同的服务指定特定的路由规则，`route`协议在注册中心的`URL`以`route://`开头。实现逻辑与`override`相同，都使用注册、取消注册方
+
+法来实现。
+
+
+
+## LoadBalance的实现
+
+​		如果不做任何配置，则默认使用`RandomLoadBalance`，即加权随机负载算法。可以在服务治理平台里修改某个服务的负载均衡策略，负载均衡对象会被转换成
+
+一个`override`对象，并使用`override`协议实现新增、更新、删除等操作。
+
+
+
+## Weight的实现
+
+​		不同的负载均衡策略还会受到权重的影响。当对服务设置了权重后，对权重高的节点会提高调用频率，对权重低的节点会降低调用频率。
+
+​		`Weight`的实现与其他配置功能的实现相似，首先把前端传入的参数转换为`Weight`对象，然后把`Weight`对象转换为`URL`，最后使用`overrideService`把`URL`
+
+发布到注册中心。
+
+
+
+
+
+
+
 
 
 
